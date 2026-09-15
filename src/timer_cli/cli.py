@@ -10,27 +10,40 @@ import subprocess
 import sys
 import time
 import uuid
+from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
+from .delivery import (
+    CLAIM_SCHEMA,
+    DeliveryError,
+    ack_event,
+    claim_event,
+    compact_events,
+    drain_events,
+    nack_event,
+    peek_events,
+)
 from .scheduler import (
     TIMER_SCHEMA,
     append_event,
     emit_once,
     iso_time,
     make_event,
+    read_event_records,
     read_events,
     schema_document,
 )
 
-
 DURATION_RE = re.compile(r"(?i)(\d+(?:\.\d+)?)(h|m|s)")
 TOP_LEVEL_COMMANDS = {
     "start", "list", "status", "cancel", "rename", "wait", "watch", "pending", "drain",
-    "daemon", "every", "schema", "stopwatch", "-h", "--help",
+    "claim", "ack", "nack", "compact", "daemon", "every", "schema", "stopwatch", "-h", "--help",
 }
+
+REF_RE = re.compile(r"^(session|thread|task):.+$")
 STOPWATCH_COMMANDS = {"start", "list", "status", "pause", "resume", "lap", "reset", "stop", "-h", "--help"}
 STOPWATCH_SHORTCUTS = {"lap", "pause", "resume", "reset"}
 
@@ -47,6 +60,27 @@ def namespace_for(args: argparse.Namespace) -> str:
 
 def owner_for(args: argparse.Namespace) -> str:
     return getattr(args, "owner", None) or os.environ.get("TIMER_OWNER", "local")
+
+
+def payload_for(args: argparse.Namespace) -> dict[str, Any] | None:
+    inline = getattr(args, "payload", None)
+    payload_file = getattr(args, "payload_file", None)
+    if inline and payload_file:
+        raise TimerError("invalid", "use only one of --payload or --payload-file")
+    if not inline and not payload_file:
+        return None
+    try:
+        value = json.loads(inline) if inline else json.loads(Path(payload_file).expanduser().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise TimerError("invalid", f"invalid continuation payload: {error}") from error
+    if not isinstance(value, dict):
+        raise TimerError("invalid", "continuation payload must be a JSON object")
+    return value
+
+
+def validate_ref(value: str | None) -> None:
+    if value is not None and not REF_RE.fullmatch(value):
+        raise TimerError("invalid", "--ref must begin with session:, thread:, or task:")
 
 
 def parse_duration(value: str) -> float:
@@ -210,6 +244,8 @@ def public_timer(
     for field in ("message", "ref"):
         if timer.get(field) is not None:
             result[field] = timer[field]
+    if timer.get("payload") is not None:
+        result["payload"] = timer["payload"]
     return result
 
 
@@ -332,6 +368,8 @@ def require_owner(timer: dict[str, Any], args: argparse.Namespace) -> None:
 
 def command_start(args: argparse.Namespace) -> int:
     duration = parse_duration(args.duration)
+    validate_ref(args.ref)
+    payload = payload_for(args)
     now = time.time()
     namespace = namespace_for(args)
     owner = owner_for(args)
@@ -350,6 +388,7 @@ def command_start(args: argparse.Namespace) -> int:
         "display_unit": duration_unit(args.duration),
         "message": args.message,
         "ref": args.ref,
+        "payload": payload,
         "namespace": namespace,
         "owner": owner,
     }
@@ -426,12 +465,16 @@ def public_series(series: dict[str, Any], *, event: str = "status") -> dict[str,
     for field in ("message", "ref"):
         if series.get(field) is not None:
             result[field] = series[field]
+    if series.get("payload") is not None:
+        result["payload"] = series["payload"]
     return result
 
 
 def command_every(args: argparse.Namespace) -> int:
     interval = parse_duration(args.interval)
     until = parse_duration(args.until)
+    validate_ref(args.ref)
+    payload = payload_for(args)
     if interval > until:
         raise TimerError("invalid", "recurring interval cannot be longer than --until")
     now = time.time()
@@ -478,6 +521,7 @@ def command_every(args: argparse.Namespace) -> int:
             "tick_count": 0,
             "message": args.message,
             "ref": args.ref,
+            "payload": payload,
             "namespace": namespace,
             "owner": owner,
         }
@@ -747,28 +791,13 @@ def refresh_all(state: dict[str, Any], now: float | None = None) -> None:
                 },
             )
             append_event(state_path(), event)
+            series["last_event_id"] = event["event_id"]
             series["next_at"] += series["interval_seconds"]
             emitted += 1
             if emitted >= 100:
                 break
         if series["next_at"] > series["until_at"]:
             series["status"] = "completed"
-
-
-def visible_events(
-    state: dict[str, Any], args: argparse.Namespace, *, include_acked: bool = False
-) -> list[dict[str, Any]]:
-    acknowledged = set(state.get("acked_event_ids", []))
-    namespace = namespace_for(args)
-    events = [event for event in read_events(state_path()) if event.get("namespace", "default") == namespace]
-    if getattr(args, "mine", False):
-        events = [event for event in events if event.get("owner", "local") == owner_for(args)]
-    event_type = getattr(args, "event_type", None)
-    if event_type:
-        events = [event for event in events if event.get("event") == event_type]
-    if not include_acked:
-        events = [event for event in events if event["event_id"] not in acknowledged]
-    return events
 
 
 def emit_events(events: list[dict[str, Any]], as_json: bool) -> None:
@@ -786,7 +815,16 @@ def emit_events(events: list[dict[str, Any]], as_json: bool) -> None:
 def command_pending(args: argparse.Namespace) -> int:
     with locked_state() as (state, _):
         refresh_all(state)
-        events = visible_events(state, args)
+        acknowledged = set(state.get("acked_event_ids", [])) if not args.consumer else set()
+    consumer = args.consumer or legacy_consumer(args)
+    events = peek_events(
+        state_path(),
+        consumer=consumer,
+        namespace=namespace_for(args),
+        owner=owner_for(args) if args.mine else None,
+        event_type=args.event_type,
+        acknowledged_event_ids=acknowledged,
+    )
     emit_events(events, args.json)
     return 0
 
@@ -794,27 +832,135 @@ def command_pending(args: argparse.Namespace) -> int:
 def command_drain(args: argparse.Namespace) -> int:
     with locked_state() as (state, _):
         refresh_all(state)
-        events = visible_events(state, args)
-        acknowledged = set(state.get("acked_event_ids", []))
-        acknowledged.update(event["event_id"] for event in events)
-        state["acked_event_ids"] = sorted(acknowledged)
+        acknowledged = set(state.get("acked_event_ids", [])) if not args.consumer else set()
+    consumer = args.consumer or legacy_consumer(args)
+    events = drain_events(
+        state_path(),
+        consumer=consumer,
+        namespace=namespace_for(args),
+        owner=owner_for(args) if args.mine else None,
+        event_type=args.event_type,
+        acknowledged_event_ids=acknowledged,
+    )
     emit_events(events, args.json)
     return 0
 
 
+def legacy_consumer(args: argparse.Namespace) -> str:
+    owner = owner_for(args) if getattr(args, "mine", False) else "all"
+    event_type = getattr(args, "event_type", None) or "all"
+    return f"legacy:{namespace_for(args)}:{owner}:{event_type}"
+
+
+def emit_claim(payload: dict[str, Any], as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(payload, separators=(",", ":")))
+        return
+    if payload["event"] == "claimed":
+        event = payload["delivery"]
+        suffix = f': {event["message"]}' if event.get("message") else ""
+        print(f'claimed {event["event"]} {event["key"]}{suffix}')
+    elif payload["event"] == "busy":
+        print(f'{payload["consumer"]}: event lease is still active')
+    else:
+        print(f'{payload["consumer"]}: no available event')
+
+
+def command_claim(args: argparse.Namespace) -> int:
+    lease = parse_duration(args.lease)
+    with locked_state() as (state, _):
+        refresh_all(state)
+    payload = claim_event(
+        state_path(),
+        consumer=args.consumer,
+        lease_seconds=lease,
+        namespace=namespace_for(args),
+        owner=owner_for(args) if args.mine else None,
+        event_type=args.event_type,
+    )
+    emit_claim(payload, args.json)
+    return 0
+
+
+def command_ack(args: argparse.Namespace) -> int:
+    payload = ack_event(
+        state_path(), consumer=args.consumer, event_id=args.event_id, lease_id=args.lease_id
+    )
+    print(json.dumps(payload, separators=(",", ":"))) if args.json else print(
+        f'{args.event_id}: {payload["event"]} by {args.consumer}'
+    )
+    return 0
+
+
+def command_nack(args: argparse.Namespace) -> int:
+    payload = nack_event(
+        state_path(), consumer=args.consumer, event_id=args.event_id, lease_id=args.lease_id
+    )
+    print(json.dumps(payload, separators=(",", ":"))) if args.json else print(
+        f'{args.event_id}: returned by {args.consumer}'
+    )
+    return 0
+
+
+def command_compact(args: argparse.Namespace) -> int:
+    result = compact_events(state_path())
+    removed = set(result.pop("removed_event_ids"))
+    pruned_timers = 0
+    pruned_series = 0
+    pruned_stopwatches = 0
+    if removed:
+        with locked_state() as (state, _):
+            kept_timers = []
+            for timer in state["timers"]:
+                terminal_id = timer.get("emitted_events", {}).get(timer.get("status"))
+                if timer["status"] != "active" and terminal_id in removed:
+                    pruned_timers += 1
+                else:
+                    kept_timers.append(timer)
+            state["timers"] = kept_timers
+            kept_series = []
+            for series in state.get("series", []):
+                terminal_id = series.get("emitted_events", {}).get(series.get("status")) or series.get("last_event_id")
+                if series["status"] != "active" and terminal_id in removed:
+                    pruned_series += 1
+                else:
+                    kept_series.append(series)
+            state["series"] = kept_series
+            before = len(state["stopwatches"])
+            state["stopwatches"] = [item for item in state["stopwatches"] if item["status"] != "stopped"]
+            pruned_stopwatches = before - len(state["stopwatches"])
+            state.pop("acked_event_ids", None)
+            state.pop("daemon_delivered_event_ids", None)
+    payload = {
+        "ok": True,
+        "schema": "timer.compact.v1",
+        "event": "compacted",
+        **result,
+        "timers_pruned": pruned_timers,
+        "series_pruned": pruned_series,
+        "stopwatches_pruned": pruned_stopwatches,
+    }
+    print(json.dumps(payload, separators=(",", ":"))) if args.json else print(
+        f'compacted {payload["events_removed"]} events and {payload["bytes_removed"]} bytes'
+    )
+    return 0
+
+
 def command_follow(args: argparse.Namespace) -> int:
-    seen: set[str] = set()
+    offset = 0
     if args.follow:
-        seen = {event["event_id"] for event in read_events(state_path())}
+        _, offset = read_event_records(state_path())
     try:
         while True:
             with locked_state() as (state, _):
                 refresh_all(state)
-                events = visible_events(state, args, include_acked=True)
-            fresh = [event for event in events if event["event_id"] not in seen]
-            for event in fresh:
+            records, offset = read_event_records(state_path(), offset)
+            for event, _, _ in records:
+                if event.get("namespace", "default") != namespace_for(args):
+                    continue
+                if args.mine and event.get("owner", "local") != owner_for(args):
+                    continue
                 print(json.dumps(event, separators=(",", ":")), flush=True)
-                seen.add(event["event_id"])
             if args.once or not args.follow:
                 return 0
             time.sleep(args.interval)
@@ -822,53 +968,108 @@ def command_follow(args: argparse.Namespace) -> int:
         return 0
 
 
-def deliver_event(event: dict[str, Any], args: argparse.Namespace) -> None:
+def write_wake_event(event: dict[str, Any], wake_dir: str) -> None:
     encoded = json.dumps(event, separators=(",", ":"))
-    if args.wake_dir:
-        directory = Path(args.wake_dir).expanduser()
-        directory.mkdir(parents=True, exist_ok=True)
-        target = directory / f'{event["timestamp"].replace(":", "-")}-{event["event_id"]}.json'
-        temporary = target.with_suffix(".tmp")
-        temporary.write_text(encoded + "\n", encoding="utf-8")
-        temporary.replace(target)
-    if args.hook:
+    directory = Path(wake_dir).expanduser()
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / f'{event["timestamp"].replace(":", "-")}-{event["event_id"]}.json'
+    temporary = target.with_suffix(".tmp")
+    temporary.write_text(encoded + "\n", encoding="utf-8")
+    temporary.replace(target)
+
+
+def run_hook(event: dict[str, Any], hook: str, timeout: float) -> None:
+    encoded = json.dumps(event, separators=(",", ":"))
+    try:
+        result = subprocess.run(
+            [str(Path(hook).expanduser())],
+            input=encoded + "\n",
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise TimerError("hook_failed", f"hook could not run: {error}") from error
+    if result.returncode != 0:
+        detail = result.stderr.strip() or f"exit {result.returncode}"
+        raise TimerError("hook_failed", f"hook failed: {detail}")
+
+
+def deliver_consumer(
+    args: argparse.Namespace,
+    *,
+    consumer: str,
+    mode: str,
+    target: str,
+    acknowledged_event_ids: set[str],
+) -> None:
+    while True:
+        claimed = claim_event(
+            state_path(),
+            consumer=consumer,
+            lease_seconds=args.delivery_lease,
+            namespace=namespace_for(args),
+            event_type="expired,tick",
+            acknowledged_event_ids=acknowledged_event_ids,
+        )
+        if claimed["event"] != "claimed":
+            return
+        event = claimed["delivery"]
         try:
-            result = subprocess.run(
-                [str(Path(args.hook).expanduser())],
-                input=encoded + "\n",
-                text=True,
-                capture_output=True,
-                timeout=args.hook_timeout,
-                check=False,
+            if mode == "hook":
+                run_hook(event, target, args.hook_timeout)
+            else:
+                write_wake_event(event, target)
+        except (OSError, TimerError):
+            nack_event(
+                state_path(),
+                consumer=consumer,
+                event_id=event["event_id"],
+                lease_id=claimed["lease_id"],
             )
-        except (OSError, subprocess.SubprocessError) as error:
-            raise TimerError("hook_failed", f"hook could not run: {error}") from error
-        if result.returncode != 0:
-            detail = result.stderr.strip() or f"exit {result.returncode}"
-            raise TimerError("hook_failed", f"hook failed: {detail}")
+            raise
+        ack_event(
+            state_path(),
+            consumer=consumer,
+            event_id=event["event_id"],
+            lease_id=claimed["lease_id"],
+        )
 
 
 def command_daemon(args: argparse.Namespace) -> int:
     try:
         while True:
-            candidates: list[dict[str, Any]] = []
             with locked_state() as (state, _):
                 refresh_all(state)
-                delivered = set(state.setdefault("daemon_delivered_event_ids", []))
-                if args.hook or args.wake_dir:
-                    candidates = [
-                        event
-                        for event in read_events(state_path())
-                        if event.get("namespace", "default") == namespace_for(args)
-                        and event.get("event") in {"expired", "tick"}
-                        and event["event_id"] not in delivered
-                    ]
-            for event in candidates:
-                deliver_event(event, args)
-                with locked_state() as (state, _):
-                    delivered = set(state.setdefault("daemon_delivered_event_ids", []))
-                    delivered.add(event["event_id"])
-                    state["daemon_delivered_event_ids"] = sorted(delivered)
+                acknowledged = set(state.get("daemon_delivered_event_ids", []))
+            errors: list[Exception] = []
+            if args.hook:
+                hook = str(Path(args.hook).expanduser().resolve())
+                try:
+                    deliver_consumer(
+                        args,
+                        consumer=f"daemon-hook:{hook}",
+                        mode="hook",
+                        target=hook,
+                        acknowledged_event_ids=acknowledged,
+                    )
+                except (OSError, TimerError) as error:
+                    errors.append(error)
+            if args.wake_dir:
+                wake_dir = str(Path(args.wake_dir).expanduser().resolve())
+                try:
+                    deliver_consumer(
+                        args,
+                        consumer=f"wake-dir:{wake_dir}",
+                        mode="wake-dir",
+                        target=wake_dir,
+                        acknowledged_event_ids=acknowledged,
+                    )
+                except (OSError, TimerError) as error:
+                    errors.append(error)
+            if errors:
+                raise errors[0]
             if args.once:
                 return 0
             time.sleep(args.poll_interval)
@@ -877,7 +1078,14 @@ def command_daemon(args: argparse.Namespace) -> int:
 
 
 def command_schema(args: argparse.Namespace) -> int:
-    print(json.dumps(schema_document(), indent=None if args.json else 2, separators=(",", ":") if args.json else None))
+    document = schema_document()
+    document["contracts"]["claim"] = {
+        "schema": CLAIM_SCHEMA,
+        "events": ["claimed", "busy", "empty", "acked", "already_acked", "nacked"],
+        "claimed_required": ["consumer", "lease_id", "lease_until", "delivery"],
+        "ack_input_required": ["consumer", "event_id", "lease_id"],
+    }
+    print(json.dumps(document, indent=None if args.json else 2, separators=(",", ":") if args.json else None))
     return 0
 
 
@@ -1086,7 +1294,9 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--label", help="human-readable timer label")
     start.add_argument("--key", help="idempotent timer key; also becomes the label when --label is omitted")
     start.add_argument("--message", help="continuation message returned with timer events")
-    start.add_argument("--ref", help="opaque task or workflow reference")
+    start.add_argument("--ref", help="route reference: session:<id>, thread:<id>, or task:<id>")
+    start.add_argument("--payload", help="structured continuation JSON object")
+    start.add_argument("--payload-file", help="path to a structured continuation JSON object")
     add_scope_arguments(start)
     start.add_argument("--json", action="store_true")
     start.set_defaults(func=command_start)
@@ -1138,9 +1348,30 @@ def build_parser() -> argparse.ArgumentParser:
     ):
         inbox = subparsers.add_parser(name, help=help_text)
         inbox.add_argument("--event", dest="event_type", choices=("started", "expired", "cancelled", "lap", "tick"))
+        inbox.add_argument("--consumer", help="independent delivery cursor; defaults to a legacy cursor")
         inbox.add_argument("--json", action="store_true")
         add_scope_arguments(inbox, mine=True)
         inbox.set_defaults(func=function)
+
+    claim = subparsers.add_parser("claim", help="lease the next event for one consumer")
+    claim.add_argument("--consumer", required=True, help="stable delivery-path or agent identity")
+    claim.add_argument("--lease", default="60s", help="lease duration such as 60s")
+    claim.add_argument("--event", dest="event_type", choices=("started", "expired", "cancelled", "lap", "tick"))
+    claim.add_argument("--json", action="store_true")
+    add_scope_arguments(claim, mine=True)
+    claim.set_defaults(func=command_claim)
+
+    for name, function in (("ack", command_ack), ("nack", command_nack)):
+        delivery = subparsers.add_parser(name, help=f"{name} a leased event")
+        delivery.add_argument("event_id")
+        delivery.add_argument("--consumer", required=True)
+        delivery.add_argument("--lease-id", required=True, help="claim generation returned by timer claim")
+        delivery.add_argument("--json", action="store_true")
+        delivery.set_defaults(func=function)
+
+    compact = subparsers.add_parser("compact", help="truncate events consumed by every delivery path")
+    compact.add_argument("--json", action="store_true")
+    compact.set_defaults(func=command_compact)
 
     daemon = subparsers.add_parser("daemon", help="materialize expiration events and notify a host")
     daemon.add_argument("--hook", help="executable receiving each expiry event as JSON on stdin")
@@ -1148,6 +1379,7 @@ def build_parser() -> argparse.ArgumentParser:
     daemon.add_argument("--once", action="store_true", help="process due timers once and exit")
     daemon.add_argument("--poll-interval", type=positive_float, default=0.25)
     daemon.add_argument("--hook-timeout", type=positive_float, default=30.0)
+    daemon.add_argument("--delivery-lease", type=positive_float, default=60.0, help=argparse.SUPPRESS)
     daemon.add_argument("--json", action="store_true")
     add_scope_arguments(daemon)
     daemon.set_defaults(func=command_daemon)
@@ -1158,7 +1390,9 @@ def build_parser() -> argparse.ArgumentParser:
     every.add_argument("--key", required=True, help="idempotent recurring schedule key")
     every.add_argument("--label", help="human-readable label")
     every.add_argument("--message", help="continuation message returned with each tick")
-    every.add_argument("--ref", help="opaque task or workflow reference")
+    every.add_argument("--ref", help="route reference: session:<id>, thread:<id>, or task:<id>")
+    every.add_argument("--payload", help="structured continuation JSON object")
+    every.add_argument("--payload-file", help="path to a structured continuation JSON object")
     every.add_argument("--json", action="store_true")
     add_scope_arguments(every)
     every.set_defaults(func=command_every)
@@ -1251,7 +1485,7 @@ def main(argv: list[str] | None = None) -> int:
         return args.func(args)
     except (ValueError, KeyError, json.JSONDecodeError) as error:
         message = error.args[0] if error.args else str(error)
-        if isinstance(error, TimerError):
+        if isinstance(error, (TimerError, DeliveryError)):
             code = error.code
         elif isinstance(error, KeyError):
             code = "not_found"

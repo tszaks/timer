@@ -89,32 +89,41 @@ timer start 10m --label rice --json
 timer status rice --json
 ```
 
-## Deferred messages for agents
+## Deferred work for agents
 
-A keyed timer can carry a continuation message and an opaque reference:
+A keyed timer can carry a continuation message, a structured payload, and a route reference:
 
 ```sh
 timer start 10m --key rice --json \
   --message "Check the pot. If still wet, start another 3m timer. If done, plate it." \
-  --ref task:cook-1
+  --ref thread:01abc123 \
+  --payload '{"action":"inspect_rice","retry":"3m"}'
 ```
 
 `--key` makes start idempotent. Retrying the same active key and duration returns the original timer, including its original message and deadline. Reusing that active key with a different duration returns a structured `conflict` error. Ordinary human labels keep their original duplicate-rejection behavior.
 
-When the timer expires, its continuation is preserved in an append-only `events.jsonl` inbox. Peek without changing it, or drain and acknowledge the returned events:
+References use one of three explicit forms: `session:<id>`, `thread:<id>`, or `task:<id>`. A task reference is a logical work ID; its payload can include `route_ref: "thread:<id>"` when a supervisor also needs a concrete destination. `--payload-file` accepts the same JSON object from a file.
+
+When the timer expires, its continuation is preserved in an append-only `events.jsonl` inbox. Agents should claim one event for a stable consumer, perform the work, and acknowledge only after the work succeeds:
 
 ```sh
-timer pending --event expired --json
-timer drain --event expired --json
+timer claim --consumer codex:cook --event expired --lease 2m --json
+timer ack EVENT_ID --consumer codex:cook --lease-id LEASE_ID --json
+# Or release a failed attempt immediately:
+timer nack EVENT_ID --consumer codex:cook --lease-id LEASE_ID --json
 ```
+
+Claims are leases. A claim returns both the event and a unique `lease_id`; acknowledgements require both IDs, so a stale worker cannot finish a newer worker's lease. If a worker dies, the same event becomes available to that consumer after the lease expires. Each consumer has an independent cursor, so a hook, a wake-directory bridge, and an agent can all receive the same event. Processes using the same consumer name compete for one delivery stream. Delivery is at least once; use the stable `event_id` as an idempotency key when the downstream action must have exactly-once effects.
+
+`pending` and `drain` remain available for inspection and simple scripts. Give them `--consumer NAME` when the cursor must be explicit. Do not use `drain` for consequential agent work because it acknowledges before the caller completes its action.
 
 An expiration event has a stable `timer.event.v1` schema:
 
 ```json
-{"ok":true,"schema":"timer.event.v1","event":"expired","key":"rice","message":"Check the pot. If still wet, start another 3m timer. If done, plate it.","ref":"task:cook-1"}
+{"ok":true,"schema":"timer.event.v1","event":"expired","key":"rice","message":"Check the pot. If still wet, start another 3m timer. If done, plate it.","ref":"thread:01abc123","payload":{"action":"inspect_rice","retry":"3m"}}
 ```
 
-The real event also includes its event ID, timer ID, timestamp, namespace, owner, deadline, status, and remaining seconds. `pending` peeks; `drain` acknowledges only the events it returns.
+The real event also includes its event ID, timer ID, timestamp, namespace, owner, deadline, status, and remaining seconds.
 
 ## Waiting and streaming
 
@@ -136,7 +145,7 @@ timer watch --json --follow
 
 Human `timer watch` keeps its live countdown display.
 
-## Daemon and host wake-up
+## Daemon, host wake-up, and Codex continuation
 
 `timer daemon` is an optional foreground clock. It materializes due events even when no agent is polling. The host can receive each expiry through an executable hook, wake files, or both:
 
@@ -145,7 +154,23 @@ timer daemon --hook /path/to/wakeup.sh
 timer daemon --wake-dir /path/to/watched-directory
 ```
 
-Hooks are executed directly without a shell and receive one JSON event on standard input. Wake files are written atomically. `timer daemon --once` is useful for schedulers and tests. Timer deliberately does not contain Codex-, Claude-, or framework-specific resume logic; the host decides how an event resumes an agent.
+Hooks are executed directly without a shell and receive one JSON event on standard input. Wake files are written atomically. `timer daemon --once` is useful for schedulers and tests. A failed hook is negatively acknowledged so the event can be retried.
+
+The package also installs a reference Codex adapter:
+
+```sh
+timer daemon --hook "$(command -v timer-supervisor)"
+```
+
+For an event routed to `session:<id>` or `thread:<id>`, `timer-supervisor` queues a new turn with `codex queue`. It can be tested without sending anything:
+
+```sh
+timer claim --consumer supervisor:test --event expired --json \
+  | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["delivery"]))' \
+  | timer-supervisor --dry-run
+```
+
+Example service definitions live in `examples/launchd/` and `examples/systemd/`. They are templates only: installing the package does not install or start a background service. The included agent protocol is in `skills/timer-agent/SKILL.md`.
 
 ## Namespaces and ownership
 
@@ -179,11 +204,19 @@ With `--json`, expected domain outcomes always exit 0 and put success or failure
 timer schema --json
 ```
 
-This prints the current `timer.v1` command and `timer.event.v1` event contracts.
+This prints the current `timer.v1` command, `timer.event.v1` event, and `timer.claim.v1` lease contracts.
 
 ## Persistence and recovery
 
-The `wait` process does not own a timer. Absolute deadlines, recurring schedules, inbox acknowledgements, and ownership metadata persist on disk, so another process or later session can recover them. By default, state is stored in `~/.local/share/timer/timers.json` and events in the adjacent `events.jsonl` file. The daemon is optional for ordinary start, list, cancel, pending, and drain operations; it is the push bridge when a host needs proactive delivery.
+The `wait` process does not own a timer. Absolute deadlines, recurring schedules, consumer cursors, leases, and ownership metadata persist on disk, so another process or later session can recover them. By default, state is stored in `~/.local/share/timer/timers.json`, events in the adjacent `events.jsonl`, and delivery state in `consumers.json`. `TIMER_STATE`, `TIMER_EVENTS`, and `TIMER_CONSUMERS` override those paths.
+
+Reads and claims start at each consumer's byte cursor instead of rescanning the entire event history. After every durable consumer has acknowledged what it needs, compact the common consumed prefix:
+
+```sh
+timer compact --json
+```
+
+Compaction stops at the oldest consumer cursor and also prunes terminal timer records whose terminal event is safely beyond that boundary. Its journal repairs cursor offsets after an interrupted log replacement. A forgotten consumer intentionally prevents removal; use stable, purposeful consumer names.
 
 ## Tests
 

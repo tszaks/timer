@@ -1,0 +1,12 @@
+[Unit]
+Description=Timer continuation supervisor
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/timer daemon --hook %h/.local/bin/timer-supervisor --namespace default
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

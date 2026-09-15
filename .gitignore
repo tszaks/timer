@@ -4,6 +4,7 @@ __pycache__/
 .verification/
 .pytest_cache/
 .venv/
+uv.lock
 build/
 dist/
 PROJECT_STATUS.md

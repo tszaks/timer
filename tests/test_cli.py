@@ -1,14 +1,15 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
-
 
 ROOT = Path(__file__).resolve().parents[1]
 CLI = ROOT / "timer"
@@ -18,7 +19,7 @@ class TimerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.env = dict(os.environ)
-        for name in ("TIMER_EVENTS", "TIMER_NAMESPACE", "TIMER_OWNER"):
+        for name in ("TIMER_CONSUMERS", "TIMER_EVENTS", "TIMER_NAMESPACE", "TIMER_OWNER"):
             self.env.pop(name, None)
         self.env["TIMER_STATE"] = str(Path(self.temp.name) / "timers.json")
 
@@ -27,7 +28,25 @@ class TimerTests(unittest.TestCase):
 
     def run_cli(self, *args: str, expected: int = 0) -> subprocess.CompletedProcess[str]:
         result = subprocess.run(
-            [str(CLI), *args], text=True, capture_output=True, env=self.env, timeout=3
+            [str(CLI), *args], text=True, capture_output=True, env=self.env, timeout=3,
+            check=False,
+        )
+        self.assertEqual(result.returncode, expected, result.stderr)
+        return result
+
+    def run_supervisor(
+        self, event: dict[str, object], *args: str, expected: int = 0
+    ) -> subprocess.CompletedProcess[str]:
+        env = dict(self.env)
+        env["PYTHONPATH"] = str(ROOT / "src")
+        result = subprocess.run(
+            [sys.executable, "-m", "timer_cli.supervisor", *args],
+            input=json.dumps(event),
+            text=True,
+            capture_output=True,
+            env=env,
+            timeout=3,
+            check=False,
         )
         self.assertEqual(result.returncode, expected, result.stderr)
         return result
@@ -370,6 +389,47 @@ class TimerTests(unittest.TestCase):
         self.assertEqual(event["key"], "hooked")
         self.assertEqual(event["message"], "Continue work")
 
+    def test_daemon_hook_and_wake_directory_have_independent_delivery(self) -> None:
+        hook = Path(self.temp.name) / "hook.sh"
+        hook_output = Path(self.temp.name) / "hook-event.json"
+        wake_dir = Path(self.temp.name) / "wake"
+        hook.write_text('#!/bin/sh\ncat > "$TIMER_HOOK_OUTPUT"\n', encoding="utf-8")
+        hook.chmod(0o700)
+        self.env["TIMER_HOOK_OUTPUT"] = str(hook_output)
+        self.run_cli("start", "0.05s", "--key", "both-paths", "--message", "Resume work")
+        time.sleep(0.08)
+
+        self.run_cli(
+            "daemon", "--once", "--hook", str(hook), "--wake-dir", str(wake_dir)
+        )
+
+        hook_event = json.loads(hook_output.read_text(encoding="utf-8"))
+        wake_files = list(wake_dir.glob("*.json"))
+        self.assertEqual(len(wake_files), 1)
+        wake_event = json.loads(wake_files[0].read_text(encoding="utf-8"))
+        self.assertEqual(hook_event["event_id"], wake_event["event_id"])
+
+    def test_failed_daemon_hook_releases_claim_for_retry(self) -> None:
+        hook = Path(self.temp.name) / "retry.sh"
+        output = Path(self.temp.name) / "retried-event.json"
+        wake_dir = Path(self.temp.name) / "healthy-wake"
+        hook.write_text("#!/bin/sh\nexit 7\n", encoding="utf-8")
+        hook.chmod(0o700)
+        self.env["TIMER_HOOK_OUTPUT"] = str(output)
+        self.run_cli("start", "0.05s", "--key", "retry-hook")
+        time.sleep(0.08)
+
+        failed = self.run_cli(
+            "daemon", "--once", "--hook", str(hook), "--wake-dir", str(wake_dir), expected=2
+        )
+        self.assertIn("hook failed", failed.stderr)
+        self.assertEqual(len(list(wake_dir.glob("*.json"))), 1)
+        hook.write_text('#!/bin/sh\ncat > "$TIMER_HOOK_OUTPUT"\n', encoding="utf-8")
+        self.run_cli("daemon", "--once", "--hook", str(hook))
+
+        event = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(event["key"], "retry-hook")
+
     def test_json_domain_errors_exit_success_with_stable_schema(self) -> None:
         missing = self.run_cli("status", "--key", "missing", "--json")
         payload = json.loads(missing.stdout)
@@ -466,6 +526,304 @@ class TimerTests(unittest.TestCase):
         self.assertIn("started", {event["event"] for event in events})
         self.assertIn("expired", {event["event"] for event in events})
         self.assertTrue(all(event["schema"] == "timer.event.v1" for event in events))
+
+    def test_claim_ack_nack_and_consumer_isolation(self) -> None:
+        self.run_cli("start", "0.05s", "--key", "claimable", "--message", "Continue")
+        self.run_cli("wait", "--key", "claimable", "--json")
+
+        first = json.loads(
+            self.run_cli("claim", "--consumer", "agent:a", "--lease", "1s", "--event", "expired", "--json").stdout
+        )
+        busy = json.loads(
+            self.run_cli("claim", "--consumer", "agent:a", "--lease", "1s", "--event", "expired", "--json").stdout
+        )
+        independent = json.loads(
+            self.run_cli("claim", "--consumer", "agent:b", "--lease", "1s", "--event", "expired", "--json").stdout
+        )
+        event_id = first["delivery"]["event_id"]
+        acked = json.loads(
+            self.run_cli(
+                "ack", event_id, "--consumer", "agent:a", "--lease-id", first["lease_id"], "--json"
+            ).stdout
+        )
+        empty = json.loads(
+            self.run_cli("claim", "--consumer", "agent:a", "--lease", "1s", "--event", "expired", "--json").stdout
+        )
+        nacked = json.loads(
+            self.run_cli(
+                "nack", event_id, "--consumer", "agent:b", "--lease-id", independent["lease_id"], "--json"
+            ).stdout
+        )
+        redelivered = json.loads(
+            self.run_cli("claim", "--consumer", "agent:b", "--lease", "1s", "--event", "expired", "--json").stdout
+        )
+
+        self.assertEqual(first["event"], "claimed")
+        self.assertEqual(busy["event"], "busy")
+        self.assertEqual(independent["delivery"]["event_id"], event_id)
+        self.assertEqual(acked["event"], "acked")
+        self.assertEqual(empty["event"], "empty")
+        self.assertEqual(nacked["event"], "nacked")
+        self.assertEqual(redelivered["delivery"]["event_id"], event_id)
+
+    def test_expired_lease_redelivers_same_event(self) -> None:
+        self.run_cli("start", "0.05s", "--key", "lease")
+        self.run_cli("wait", "--key", "lease", "--json")
+        first = json.loads(
+            self.run_cli("claim", "--consumer", "agent:lease", "--lease", "0.05s", "--event", "expired", "--json").stdout
+        )
+        time.sleep(0.08)
+        second = json.loads(
+            self.run_cli("claim", "--consumer", "agent:lease", "--lease", "1s", "--event", "expired", "--json").stdout
+        )
+
+        self.assertEqual(first["delivery"]["event_id"], second["delivery"]["event_id"])
+        self.assertNotEqual(first["lease_id"], second["lease_id"])
+
+        stale = json.loads(
+            self.run_cli(
+                "nack", first["delivery"]["event_id"], "--consumer", "agent:lease",
+                "--lease-id", first["lease_id"], "--json",
+            ).stdout
+        )
+        busy = json.loads(
+            self.run_cli(
+                "claim", "--consumer", "agent:lease", "--lease", "1s", "--event", "expired", "--json"
+            ).stdout
+        )
+
+        self.assertEqual(stale["error"]["code"], "lease_mismatch")
+        self.assertEqual(busy["event"], "busy")
+
+    def test_compaction_stops_at_oldest_consumer_cursor(self) -> None:
+        expired_ids = []
+        for index in range(3):
+            key = f"compact-{index}"
+            self.run_cli("start", "0.02s", "--key", key)
+            event = json.loads(self.run_cli("wait", "--key", key, "--json").stdout)
+            expired_ids.append(event["event_id"])
+
+        for _ in range(3):
+            claimed = json.loads(
+                self.run_cli("claim", "--consumer", "fast", "--event", "expired", "--json").stdout
+            )
+            self.run_cli(
+                "ack", claimed["delivery"]["event_id"], "--consumer", "fast",
+                "--lease-id", claimed["lease_id"], "--json",
+            )
+        slow = json.loads(
+            self.run_cli("claim", "--consumer", "slow", "--event", "expired", "--json").stdout
+        )
+        self.run_cli(
+            "ack", slow["delivery"]["event_id"], "--consumer", "slow",
+            "--lease-id", slow["lease_id"], "--json",
+        )
+
+        compacted = json.loads(self.run_cli("compact", "--json").stdout)
+        next_slow = json.loads(
+            self.run_cli("claim", "--consumer", "slow", "--event", "expired", "--json").stdout
+        )
+        remaining = json.loads(self.run_cli("list", "--all", "--json").stdout)
+
+        self.assertGreater(compacted["bytes_removed"], 0)
+        self.assertEqual(compacted["events_removed"], 2)
+        self.assertEqual(compacted["timers_pruned"], 1)
+        self.assertEqual(next_slow["delivery"]["event_id"], expired_ids[1])
+        self.assertEqual({item["key"] for item in remaining}, {"compact-1", "compact-2"})
+
+    def test_shared_event_log_uses_one_consumer_registry_for_compaction(self) -> None:
+        shared_events = Path(self.temp.name) / "shared" / "events.jsonl"
+        self.env["TIMER_EVENTS"] = str(shared_events)
+        self.run_cli("start", "0.05s", "--key", "shared-log")
+        expired = json.loads(self.run_cli("wait", "--key", "shared-log", "--json").stdout)
+        slow = json.loads(
+            self.run_cli("claim", "--consumer", "slow-shared", "--event", "expired", "--json").stdout
+        )
+        fast = json.loads(
+            self.run_cli("claim", "--consumer", "fast-shared", "--event", "expired", "--json").stdout
+        )
+        self.run_cli(
+            "ack", fast["delivery"]["event_id"], "--consumer", "fast-shared",
+            "--lease-id", fast["lease_id"], "--json",
+        )
+
+        original_state = self.env["TIMER_STATE"]
+        self.env["TIMER_STATE"] = str(Path(self.temp.name) / "second-state.json")
+        compacted = json.loads(self.run_cli("compact", "--json").stdout)
+        self.run_cli(
+            "nack", slow["delivery"]["event_id"], "--consumer", "slow-shared",
+            "--lease-id", slow["lease_id"], "--json",
+        )
+        reclaimed = json.loads(
+            self.run_cli("claim", "--consumer", "slow-shared", "--event", "expired", "--json").stdout
+        )
+        self.env["TIMER_STATE"] = original_state
+
+        self.assertEqual(compacted["events_removed"], 1)
+        self.assertEqual(reclaimed["delivery"]["event_id"], expired["event_id"])
+
+    def test_interrupted_compaction_rebases_cursors_from_journal(self) -> None:
+        expired_ids = []
+        for index in range(2):
+            key = f"recover-{index}"
+            self.run_cli("start", "0.02s", "--key", key)
+            event = json.loads(self.run_cli("wait", "--key", key, "--json").stdout)
+            expired_ids.append(event["event_id"])
+        first = json.loads(
+            self.run_cli("claim", "--consumer", "recovering", "--event", "expired", "--json").stdout
+        )
+        self.run_cli(
+            "ack", first["delivery"]["event_id"], "--consumer", "recovering",
+            "--lease-id", first["lease_id"], "--json",
+        )
+
+        registry_path = Path(self.temp.name) / "consumers.json"
+        event_path = Path(self.temp.name) / "events.jsonl"
+        registry = json.loads(registry_path.read_text(encoding="utf-8"))
+        cutoff = registry["consumers"]["recovering"]["cursor"]
+        old_events = event_path.read_bytes()
+        remainder = old_events[cutoff:]
+        state_after = json.loads(json.dumps(registry))
+        state_after["generation"] = registry.get("generation", 0) + 1
+        state_after["consumers"]["recovering"]["cursor"] = 0
+        journal = {
+            "schema": "timer.compaction-journal.v1",
+            "old_event_digest": hashlib.sha256(old_events).hexdigest(),
+            "old_event_size": len(old_events),
+            "new_event_digest": hashlib.sha256(remainder).hexdigest(),
+            "new_event_size": len(remainder),
+            "target_generation": state_after["generation"],
+            "consumer_state_after": state_after,
+        }
+        event_path.write_bytes(remainder)
+        registry_path.with_name("consumers.json.compact-journal").write_text(
+            json.dumps(journal), encoding="utf-8"
+        )
+
+        recovered = json.loads(
+            self.run_cli("claim", "--consumer", "recovering", "--event", "expired", "--json").stdout
+        )
+
+        self.assertEqual(recovered["delivery"]["event_id"], expired_ids[1])
+        self.assertFalse(registry_path.with_name("consumers.json.compact-journal").exists())
+
+    def test_legacy_acknowledgements_seed_default_consumer_cursor(self) -> None:
+        self.run_cli("start", "0.05s", "--key", "already-drained")
+        expired = json.loads(self.run_cli("wait", "--key", "already-drained", "--json").stdout)
+        state_path = Path(self.env["TIMER_STATE"])
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["acked_event_ids"] = [expired["event_id"]]
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+
+        pending = json.loads(self.run_cli("pending", "--json").stdout)
+
+        self.assertEqual([event["event"] for event in pending], ["started"])
+
+    def test_structured_payload_and_reference_convention(self) -> None:
+        payload = {
+            "goal": "Check deploy",
+            "done_when": "success or failed",
+            "artifacts": ["logs/deploy.txt"],
+            "budget": {"ticks_left": 12},
+        }
+        self.run_cli(
+            "start", "0.05s", "--key", "payload", "--message", "Continue deploy",
+            "--ref", "thread:abc-123", "--payload", json.dumps(payload), "--json",
+        )
+        event = json.loads(self.run_cli("wait", "--key", "payload", "--json").stdout)
+        invalid = json.loads(
+            self.run_cli("start", "1m", "--key", "bad-ref", "--ref", "opaque", "--json").stdout
+        )
+
+        self.assertEqual(event["payload"], payload)
+        self.assertEqual(event["ref"], "thread:abc-123")
+        self.assertEqual(invalid["error"]["code"], "invalid")
+
+    def test_payload_file_is_preserved_in_expiration_event(self) -> None:
+        payload_file = Path(self.temp.name) / "work.json"
+        payload_file.write_text('{"action":"check_build","attempt":2}\n', encoding="utf-8")
+        self.run_cli(
+            "start", "0.05s", "--key", "payload-file", "--ref", "task:build-2",
+            "--payload-file", str(payload_file), "--json",
+        )
+
+        event = json.loads(self.run_cli("wait", "--key", "payload-file", "--json").stdout)
+
+        self.assertEqual(event["payload"], {"action": "check_build", "attempt": 2})
+
+    def test_active_lease_prevents_compaction_past_claimed_event(self) -> None:
+        self.run_cli("start", "0.05s", "--key", "leased")
+        self.run_cli("wait", "--key", "leased")
+        claimed = json.loads(
+            self.run_cli(
+                "claim", "--consumer", "worker", "--event", "expired", "--lease", "5m", "--json"
+            ).stdout
+        )
+
+        compacted = json.loads(self.run_cli("compact", "--json").stdout)
+        self.run_cli(
+            "nack", claimed["delivery"]["event_id"], "--consumer", "worker",
+            "--lease-id", claimed["lease_id"], "--json",
+        )
+        reclaimed = json.loads(
+            self.run_cli(
+                "claim", "--consumer", "worker", "--event", "expired", "--lease", "5m", "--json"
+            ).stdout
+        )
+
+        self.assertEqual(claimed["event"], "claimed")
+        self.assertEqual(compacted["events_removed"], 1)
+        self.assertEqual(reclaimed["delivery"]["event_id"], claimed["delivery"]["event_id"])
+
+    def test_reference_supervisor_builds_and_queues_next_turn(self) -> None:
+        event = {
+            "ok": True,
+            "schema": "timer.event.v1",
+            "event_id": "event-1",
+            "event": "expired",
+            "id": "timer-1",
+            "key": "deploy",
+            "timestamp": "2026-09-15T10:00:00-04:00",
+            "namespace": "default",
+            "owner": "codex",
+            "ref": "thread:thread-123",
+            "message": "Check the deploy",
+            "payload": {"goal": "Intervene only on failure"},
+        }
+        dry_run = json.loads(self.run_supervisor(event, "--dry-run").stdout)
+        fake_codex = Path(self.temp.name) / "codex"
+        captured = Path(self.temp.name) / "codex-args.txt"
+        fake_codex.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$SUPERVISOR_ARGS"\n', encoding="utf-8")
+        fake_codex.chmod(0o700)
+        self.env["SUPERVISOR_ARGS"] = str(captured)
+        queued = json.loads(self.run_supervisor(event, "--codex-bin", str(fake_codex)).stdout)
+        arguments = captured.read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual(dry_run["schema"], "timer.next-turn.v1")
+        self.assertEqual(dry_run["route"], {"kind": "thread", "id": "thread-123"})
+        self.assertEqual(dry_run["work"]["goal"], "Intervene only on failure")
+        self.assertEqual(arguments[:3], ["queue", "--thread", "thread-123"])
+        self.assertEqual(arguments[3], "--message")
+        self.assertIn("timer.next-turn.v1", "\n".join(arguments[4:]))
+        self.assertEqual(queued["event"], "queued")
+
+    def test_reference_supervisor_rejects_malformed_route_without_traceback(self) -> None:
+        event = {
+            "schema": "timer.event.v1",
+            "event_id": "event-1",
+            "event": "expired",
+            "key": "deploy",
+            "payload": {"route_ref": {"thread": "abc"}},
+        }
+
+        result = self.run_supervisor(event, "--dry-run", expected=2)
+
+        self.assertIn("route references must be non-empty strings", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+        top_level = self.run_supervisor([], "--dry-run", expected=2)  # type: ignore[arg-type]
+        self.assertIn("JSON object", top_level.stderr)
+        self.assertNotIn("Traceback", top_level.stderr)
 
 
 if __name__ == "__main__":
