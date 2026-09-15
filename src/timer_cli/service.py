@@ -25,10 +25,10 @@ def checked_binary(env_name: str, default: str) -> str:
     binary = configured or shutil.which(default)
     if not binary:
         raise ServiceError("missing_dependency", f"required command not found: {default}")
-    resolved = Path(binary).expanduser().resolve()
-    if not resolved.is_file() or not os.access(resolved, os.X_OK):
-        raise ServiceError("missing_dependency", f"required command is not executable: {resolved}")
-    return str(resolved)
+    candidate = Path(binary).expanduser().absolute()
+    if not candidate.is_file() or not os.access(candidate, os.X_OK):
+        raise ServiceError("missing_dependency", f"required command is not executable: {candidate}")
+    return str(candidate)
 
 
 def run_checked(arguments: list[str], *, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
@@ -63,6 +63,12 @@ def synthetic_event(namespace: str) -> dict[str, Any]:
     }
 
 
+def service_environment_path(*binaries: str) -> str:
+    directories = [str(Path(binary).parent) for binary in binaries]
+    directories.extend(os.environ.get("PATH", os.defpath).split(os.pathsep))
+    return os.pathsep.join(dict.fromkeys(directory for directory in directories if directory))
+
+
 def preflight(namespace: str) -> dict[str, str]:
     codex_bin = checked_binary("TIMER_CODEX_BIN", "codex")
     supervisor_bin = checked_binary("TIMER_SUPERVISOR_BIN", "timer-supervisor")
@@ -77,7 +83,11 @@ def preflight(namespace: str) -> dict[str, str]:
         raise ServiceError("preflight_failed", "timer-supervisor dry run returned invalid JSON") from error
     if envelope.get("schema") != "timer.next-turn.v1":
         raise ServiceError("preflight_failed", "timer-supervisor dry run returned the wrong schema")
-    return {"codex_bin": codex_bin, "supervisor_bin": supervisor_bin}
+    return {
+        "codex_bin": codex_bin,
+        "supervisor_bin": supervisor_bin,
+        "service_path": service_environment_path(codex_bin, supervisor_bin),
+    }
 
 
 def platform_name() -> str:
@@ -104,6 +114,7 @@ def render_launchd(
     timer_bin: str,
     supervisor_bin: str,
     codex_bin: str,
+    environment_path: str,
     namespace: str,
     log_dir: Path,
 ) -> bytes:
@@ -120,7 +131,10 @@ def render_launchd(
         "RunAtLoad": True,
         "KeepAlive": True,
         "ThrottleInterval": 2,
-        "EnvironmentVariables": {"TIMER_CODEX_BIN": codex_bin},
+        "EnvironmentVariables": {
+            "TIMER_CODEX_BIN": codex_bin,
+            "PATH": environment_path,
+        },
         "StandardOutPath": str(log_dir / "timer-supervisor.log"),
         "StandardErrorPath": str(log_dir / "timer-supervisor.error.log"),
     }
@@ -131,7 +145,13 @@ def systemd_quote(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def render_systemd(timer_bin: str, supervisor_bin: str, codex_bin: str, namespace: str) -> bytes:
+def render_systemd(
+    timer_bin: str,
+    supervisor_bin: str,
+    codex_bin: str,
+    environment_path: str,
+    namespace: str,
+) -> bytes:
     content = f"""[Unit]
 Description=Timer continuation supervisor
 After=default.target
@@ -139,6 +159,7 @@ After=default.target
 [Service]
 Type=simple
 Environment={systemd_quote(f'TIMER_CODEX_BIN={codex_bin}')}
+Environment={systemd_quote(f'PATH={environment_path}')}
 ExecStart={systemd_quote(timer_bin)} daemon --hook {systemd_quote(supervisor_bin)} --namespace {systemd_quote(namespace)}
 Restart=on-failure
 RestartSec=2
@@ -159,11 +180,18 @@ def install_service(state_file: Path, *, timer_bin: str, namespace: str, dry_run
             timer_bin,
             binaries["supervisor_bin"],
             binaries["codex_bin"],
+            binaries["service_path"],
             namespace,
             log_dir,
         )
         if platform == "launchd"
-        else render_systemd(timer_bin, binaries["supervisor_bin"], binaries["codex_bin"], namespace)
+        else render_systemd(
+            timer_bin,
+            binaries["supervisor_bin"],
+            binaries["codex_bin"],
+            binaries["service_path"],
+            namespace,
+        )
     )
     result: dict[str, Any] = {
         "ok": True,

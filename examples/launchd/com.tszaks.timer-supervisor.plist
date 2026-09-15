@@ -23,6 +23,8 @@
   <dict>
     <key>TIMER_CODEX_BIN</key>
     <string>__CODEX_BIN__</string>
+    <key>PATH</key>
+    <string>__SERVICE_PATH__</string>
   </dict>
   <key>StandardOutPath</key>
   <string>__LOG_DIR__/timer-supervisor.log</string>

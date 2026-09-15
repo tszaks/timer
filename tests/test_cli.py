@@ -672,6 +672,7 @@ class TimerTests(unittest.TestCase):
         self.assertEqual(result["event"], "installed")
         self.assertTrue(service_path.exists())
         self.assertIn("bootstrap", calls.read_text(encoding="utf-8"))
+        self.assertIn("PATH", service_path.read_text(encoding="utf-8"))
         self.assertEqual(consumers[0]["name"], f"daemon-hook:{supervisor.resolve()}")
         self.assertEqual(consumers[0]["lag_bytes"], 0)
 
@@ -684,7 +685,8 @@ class TimerTests(unittest.TestCase):
         unit = service_path.read_text(encoding="utf-8")
 
         self.assertEqual(result["platform"], "systemd")
-        self.assertIn(str(supervisor.resolve()), unit)
+        self.assertIn(str(supervisor.absolute()), unit)
+        self.assertIn("Environment=\"PATH=", unit)
         self.assertIn("--user daemon-reload", calls.read_text(encoding="utf-8"))
         self.assertIn("--user enable --now timer-supervisor.service", calls.read_text(encoding="utf-8"))
 
