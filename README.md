@@ -1,60 +1,76 @@
 # Timer
 
-Timer is a Python 3.10+ local timer and stopwatch CLI. It has no third-party runtime dependencies. State is persistent, so timers and stopwatches survive terminal interruptions and Mac sleep. A waiting command completes when a timer expires, which also makes it useful for command-line agents such as Codex.
+[![Tests](https://github.com/tszaks/timer/actions/workflows/test.yml/badge.svg)](https://github.com/tszaks/timer/actions/workflows/test.yml)
 
-## Five useful commands
+Timer is a persistent timer, stopwatch, and deferred-work CLI for Unix systems. Version 0.5.0 requires Python 3.10 or newer and has no third-party runtime dependencies.
+
+Timer stores absolute deadlines on disk. Timers and stopwatches survive terminal exits and system sleep. An expiration is processed the next time a Timer command refreshes state, or shortly after its deadline when the optional daemon is running.
+
+Timer does not play a sound or display a desktop notification by itself. It can print countdowns, write expiration files, run a hook, or queue a new Codex turn through the included supervisor.
+
+## Install
+
+Clone the repository and install it with `pipx`:
+
+```sh
+git clone https://github.com/tszaks/timer.git
+cd timer
+pipx install .
+```
+
+This installs two commands:
+
+- `timer` manages timers, stopwatches, events, and delivery.
+- `timer-supervisor` converts a Timer event into a queued Codex turn.
+
+You can also run `./timer` directly from the repository without installing it.
+
+## Start a timer
 
 ```sh
 timer 10m rice
-timer 30s
+timer 25m peppers
 timer list
 timer rice
-timer cancel rice
-```
-
-The first command starts a labeled ten-minute timer. The second starts an unlabeled timer and generates the label `30s timer`. A label by itself shows that timer's status. Durations accept combinations such as `45s`, `10m`, and `1h30m`; a bare integer means seconds.
-
-For a live view, run:
-
-```sh
-timer watch
-```
-
-It refreshes active countdowns about once per second, exits when none remain, and handles Control-C cleanly. `timer watch --once` prints one read-only snapshot.
-
-Timer output preserves the largest unit originally entered: `30s`, `15m 00s`, or `1h 05m 00s`. A 15-minute timer therefore shows `0m 59s` near its end. Decimal seconds and internal IDs are hidden in normal output; `--json` retains exact numeric seconds and stable IDs for agents and scripts.
-
-Running timer labels are unique without regard to capitalization. A duplicate is refused with a suggested label such as `peppers-2`; expired and cancelled timers release their labels. Rename a running timer without changing its deadline:
-
-```sh
-timer rename peppers-1 peppers
-```
-
-Full IDs and unique ID prefixes work anywhere an explicit identifier is accepted. `list` shows active timers by default; use `list --all` to include expired and cancelled timers.
-
-Bare commands provide safe defaults:
-
-- `timer` shows active timers or one short example when none exist.
-- `timer status` shows the sole active timer or all active timers.
-- `timer cancel` cancels automatically only when exactly one timer is active; with multiple timers it refuses and lists their labels.
-- `timer stopwatch` shows active stopwatches or one short start example.
-
-Multiple labeled timers run independently:
-
-```sh
-timer 25m peppers
-timer 10m rice
-timer list
-timer peppers
-timer wait rice --json
 timer cancel peppers
 ```
 
-Waiting for one timer does not block another timer from being listed, checked, or cancelled by a separate command.
+The short form is designed for people:
+
+```text
+timer DURATION [LABEL]
+```
+
+Durations accept hours, minutes, seconds, and combinations:
+
+```sh
+timer 45s tea
+timer 10m rice
+timer 1h30m laundry
+timer 90 stretch
+```
+
+A timer without a label gets one from its duration, such as `30s timer`. Active labels are unique without regard to capitalization. Expired and cancelled timers release their labels.
+
+Useful commands:
+
+| Command | Result |
+| --- | --- |
+| `timer` | List active timers |
+| `timer LABEL` | Show one timer |
+| `timer list --all` | Include expired and cancelled timers |
+| `timer rename OLD NEW` | Rename an active timer without changing its deadline |
+| `timer cancel LABEL` | Cancel a timer |
+| `timer wait LABEL` | Block until a timer expires or is cancelled |
+| `timer watch` | Show a live, read-only countdown |
+
+Full IDs and unique ID prefixes can replace labels where an identifier is accepted. If exactly one timer is active, `timer status` and `timer cancel` can infer it. With multiple active timers, Timer requires an explicit choice.
+
+`timer watch` does not write state or materialize expiration events. It exits when no timers remain active in its view. Use `timer wait`, another state-refreshing command, or the daemon when a durable expiration event is required.
 
 ## Stopwatches
 
-Stopwatches persist their elapsed time, status, and laps across commands:
+Stopwatches persist their elapsed time, status, and laps:
 
 ```sh
 timer stopwatch start prep
@@ -67,159 +83,237 @@ timer stopwatch stop prep
 timer stopwatch list --all
 ```
 
-`status` reports the current elapsed time. `pause` freezes it, `resume` continues from that elapsed time, `lap` records both the lap duration and total duration, `reset` clears elapsed time and laps while preserving whether the stopwatch is running or paused, and `stop` finalizes it. The top-level shortcuts infer the target only when exactly one stopwatch is active; otherwise they refuse and list choices. Timer and stopwatch labels use separate namespaces. Add `--json` to any stopwatch command for structured output.
+The short `lap`, `pause`, `resume`, and `reset` commands infer the target only when one stopwatch is active. Timer and stopwatch labels use separate namespaces.
 
-## Install
+## JSON commands
 
-Clone the repository, then install it as an isolated command-line app with
-[`pipx`](https://pipx.pypa.io/):
-
-```sh
-git clone https://github.com/tszaks/timer.git
-cd timer
-pipx install .
-```
-
-The command is `timer`. You can also run the checked-out `./timer` launcher directly without installing.
-
-The explicit grammar is useful for scripts and agents:
+Scripts and agents should use the explicit command form and `--json`:
 
 ```sh
 timer start 10m --label rice --json
 timer status rice --json
+timer cancel rice --json
 ```
 
-## Deferred work for agents
+With `--json`, expected domain errors also return structured JSON and exit with status 0. Check the top-level `ok` field. Human-mode errors exit nonzero.
 
-A keyed timer can carry a continuation message, a structured payload, and a route reference:
-
-```sh
-timer start 10m --key rice --json \
-  --message "Check the pot. If still wet, start another 3m timer. If done, plate it." \
-  --ref thread:01abc123 \
-  --payload '{"action":"inspect_rice","retry":"3m"}'
-```
-
-`--key` makes start idempotent. Retrying the same active key and duration returns the original timer, including its original message and deadline. Reusing that active key with a different duration returns a structured `conflict` error. Ordinary human labels keep their original duplicate-rejection behavior.
-
-References use one of three explicit forms: `session:<id>`, `thread:<id>`, or `task:<id>`. A task reference is a logical work ID; its payload can include `route_ref: "thread:<id>"` when a supervisor also needs a concrete destination. `--payload-file` accepts the same JSON object from a file.
-
-When the timer expires, its continuation is preserved in an append-only `events.jsonl` inbox. Agents should claim one event for a stable consumer, perform the work, and acknowledge only after the work succeeds:
-
-```sh
-timer claim --consumer codex:cook --event expired --lease 2m --json
-timer ack EVENT_ID --consumer codex:cook --lease-id LEASE_ID --json
-# Or release a failed attempt immediately:
-timer nack EVENT_ID --consumer codex:cook --lease-id LEASE_ID --json
-```
-
-Claims are leases. A claim returns both the event and a unique `lease_id`; acknowledgements require both IDs, so a stale worker cannot finish a newer worker's lease. If a worker dies, the same event becomes available to that consumer after the lease expires. Each consumer has an independent cursor, so a hook, a wake-directory bridge, and an agent can all receive the same event. Processes using the same consumer name compete for one delivery stream. Delivery is at least once; use the stable `event_id` as an idempotency key when the downstream action must have exactly-once effects.
-
-`pending` and `drain` remain available for inspection and simple scripts. Give them `--consumer NAME` when the cursor must be explicit. Do not use `drain` for consequential agent work because it acknowledges before the caller completes its action.
-
-An expiration event has a stable `timer.event.v1` schema:
-
-```json
-{"ok":true,"schema":"timer.event.v1","event":"expired","key":"rice","message":"Check the pot. If still wet, start another 3m timer. If done, plate it.","ref":"thread:01abc123","payload":{"action":"inspect_rice","retry":"3m"}}
-```
-
-The real event also includes its event ID, timer ID, timestamp, namespace, owner, deadline, status, and remaining seconds.
-
-## Waiting and streaming
-
-The original blocking wait remains available:
-
-```sh
-timer wait --key rice --json
-timer wait --any rice,beans --json
-timer wait --all --key-prefix cook- --json
-```
-
-`--any` snapshots the listed keys and returns the first terminal event. `--all` snapshots the latest timer for every matching key and returns when all are terminal.
-
-For hosts that support a long-running reader, follow new events as NDJSON with no screen-clearing control codes:
-
-```sh
-timer watch --json --follow
-```
-
-Human `timer watch` keeps its live countdown display.
-
-## Daemon, host wake-up, and Codex continuation
-
-`timer daemon` is an optional foreground clock. It materializes due events even when no agent is polling. The host can receive each expiry through an executable hook, wake files, or both:
-
-```sh
-timer daemon --hook /path/to/wakeup.sh
-timer daemon --wake-dir /path/to/watched-directory
-```
-
-Hooks are executed directly without a shell and receive one JSON event on standard input. Wake files are written atomically. `timer daemon --once` is useful for schedulers and tests. A failed hook is negatively acknowledged so the event can be retried.
-
-The package also installs a reference Codex adapter:
-
-```sh
-timer daemon --hook "$(command -v timer-supervisor)"
-```
-
-For an event routed to `session:<id>` or `thread:<id>`, `timer-supervisor` queues a new turn with `codex queue`. It can be tested without sending anything:
-
-```sh
-timer claim --consumer supervisor:test --event expired --json \
-  | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["delivery"]))' \
-  | timer-supervisor --dry-run
-```
-
-Example service definitions live in `examples/launchd/` and `examples/systemd/`. They are templates only: installing the package does not install or start a background service. The included agent protocol is in `skills/timer-agent/SKILL.md`.
-
-## Namespaces and ownership
-
-Isolate agents sharing one machine:
-
-```sh
-timer start 10m --key rice --namespace agent:codex-123 --owner cook --json
-timer list --namespace agent:codex-123 --mine --owner cook --json
-timer cancel --key rice --namespace agent:codex-123 --owner cook --json
-```
-
-`TIMER_NAMESPACE` and `TIMER_OWNER` provide defaults. Cancel and rename enforce ownership unless `--force` is explicitly supplied. `TIMER_STATE` selects a different state file, and `TIMER_EVENTS` selects a different event log.
-
-## Recurring heartbeats
-
-Bounded recurring schedules emit a durable `tick` event at each interval:
-
-```sh
-timer every 2m --until 30m --key deploy \
-  --message "Read deployment status. If pending, do nothing. If failed, inspect logs."
-timer cancel --key deploy
-```
-
-Schedules are persisted, idempotent by key, capped by a required `--until`, and advanced by `daemon`, `pending`, or `drain`.
-
-## Machine-readable behavior
-
-With `--json`, expected domain outcomes always exit 0 and put success or failure in the object. Errors use codes such as `conflict`, `not_found`, `ambiguous`, and `owner_mismatch`. JSON is printed only on standard output. Human-mode errors still exit nonzero.
+Print the current command, event, and lease schemas with:
 
 ```sh
 timer schema --json
 ```
 
-This prints the current `timer.v1` command, `timer.event.v1` event, and `timer.claim.v1` lease contracts.
+## Durable work for agents
 
-## Persistence and recovery
+Use a keyed timer when an agent needs to continue work later:
 
-The `wait` process does not own a timer. Absolute deadlines, recurring schedules, consumer cursors, leases, and ownership metadata persist on disk, so another process or later session can recover them. By default, state is stored in `~/.local/share/timer/timers.json`, events in the adjacent `events.jsonl`, and delivery state in `consumers.json`. `TIMER_STATE`, `TIMER_EVENTS`, and `TIMER_CONSUMERS` override those paths.
+```sh
+timer start 10m \
+  --key rice-check \
+  --namespace agent:cook \
+  --owner codex \
+  --message "Check whether the rice is done." \
+  --ref thread:THREAD_ID \
+  --payload '{"action":"inspect_rice","retry":"3m"}' \
+  --json
+```
 
-Reads and claims start at each consumer's byte cursor instead of rescanning the entire event history. After every durable consumer has acknowledged what it needs, compact the common consumed prefix:
+`--key` makes an active timer idempotent. Repeating the same key and duration returns the existing timer. Reusing the key with a different duration returns a `conflict` error.
+
+`--payload` must be a JSON object. `--payload-file PATH` reads the same object from a file. Route references must use one of these forms:
+
+- `thread:<id>` routes directly to a Codex thread.
+- `session:<id>` routes to a Codex session through the same queue interface.
+- `task:<id>` names logical work. To use the Codex supervisor, include `"route_ref":"thread:<id>"` or `"route_ref":"session:<id>"` in the payload.
+
+### Claim, work, acknowledge
+
+Expiration events are stored in `events.jsonl`. A worker leases one event from its own consumer cursor:
+
+```sh
+timer claim \
+  --consumer codex:cook \
+  --namespace agent:cook \
+  --owner codex \
+  --mine \
+  --event expired \
+  --lease 2m \
+  --json
+```
+
+A successful claim returns `event: "claimed"`, a `delivery` object, a stable `delivery.event_id`, and a unique `lease_id`. It returns `busy` while that consumer has an active lease and `empty` when no matching event is available.
+
+After the work succeeds:
+
+```sh
+timer ack EVENT_ID \
+  --consumer codex:cook \
+  --lease-id LEASE_ID \
+  --json
+```
+
+If the work cannot begin safely, release it immediately:
+
+```sh
+timer nack EVENT_ID \
+  --consumer codex:cook \
+  --lease-id LEASE_ID \
+  --json
+```
+
+If a worker exits without either command, the event becomes claimable again after the lease expires. The `lease_id` prevents a stale worker from acknowledging or releasing a newer claim.
+
+Delivery is at least once. Use `delivery.event_id` as an idempotency key when the downstream action must happen once.
+
+Each new consumer starts at the beginning of the retained event log. Each consumer name owns one cursor and one fixed filter set. Reusing a consumer with a different namespace, owner filter, or event filter returns `consumer_conflict`. Separate delivery paths need separate consumer names. Workers that should compete for the same queue share one consumer name.
+
+### Inspect or drain events
+
+`pending` reads available events without advancing its consumer cursor:
+
+```sh
+timer pending --consumer inspector --event expired --json
+```
+
+`drain` returns and acknowledges all matching events:
+
+```sh
+timer drain --consumer simple-script --event expired --json
+```
+
+Do not use `drain` for work that must survive a crash between receipt and completion. Use `claim`, then `ack` or `nack`.
+
+Without `--consumer`, `pending` and `drain` use a compatibility cursor derived from their namespace, owner, and event filter.
+
+## Wait for timers or follow events
+
+```sh
+timer wait --key rice-check --json
+timer wait --any rice,beans --json
+timer wait --all --key-prefix cook- --json
+```
+
+`--any` snapshots the listed keys and returns the first terminal event. `--all` snapshots the latest timer for each matching key and returns when every timer is terminal.
+
+Follow events appended after the command starts as newline-delimited JSON:
+
+```sh
+timer watch --json --follow
+```
+
+This mode contains no screen-clearing control codes. It also refreshes timer and recurring-schedule state while it runs.
+
+## Daemon and delivery hooks
+
+The optional daemon runs in the foreground. It materializes due timer and recurring events and can deliver each `expired` or `tick` event to an executable hook, a wake directory, or both:
+
+```sh
+timer daemon
+timer daemon --hook /absolute/path/to/hook
+timer daemon --wake-dir /absolute/path/to/wake-directory
+timer daemon --hook /absolute/path/to/hook --wake-dir /absolute/path/to/wake-directory
+```
+
+Hooks run directly without a shell and receive one raw `timer.event.v1` JSON object on standard input. Wake files are written atomically, one file per event. Hook and wake-directory delivery use independent consumer cursors, so one path does not consume the other path's event. A new hook path or wake-directory path receives matching events still retained in the log. A failed path is released for retry after the other path has had a chance to run.
+
+Run one refresh pass and exit with:
+
+```sh
+timer daemon --once --wake-dir /absolute/path/to/wake-directory
+```
+
+Installing Timer does not start the daemon. The repository contains service templates for [launchd](examples/launchd/com.tszaks.timer-supervisor.plist) and [systemd](examples/systemd/timer-supervisor.service). Replace their placeholders and paths before installing them.
+
+## Codex supervisor
+
+`timer-supervisor` reads one raw Timer event from standard input and queues a new Codex turn with `codex queue`. The event needs a `thread:` or `session:` route, either in `ref` or in `payload.route_ref`.
+
+Connect it to the daemon:
+
+```sh
+timer daemon --hook "$(command -v timer-supervisor)"
+```
+
+Inspect the generated continuation envelope without contacting Codex:
+
+```sh
+printf '%s\n' '{"schema":"timer.event.v1","event_id":"demo-event","event":"expired","id":"demo-timer","key":"rice-check","timestamp":"2026-01-01T12:00:00Z","ref":"thread:THREAD_ID","payload":{"action":"inspect_rice"}}' \
+  | timer-supervisor --dry-run
+```
+
+The supervisor requires the Codex CLI for live delivery. Timer itself remains host-neutral, so another host can consume the same event schema through a different hook.
+
+The repository also contains an optional [Timer agent skill](skills/timer-agent/SKILL.md) with the claim and acknowledgement protocol. Installing the Python package does not install or enable that skill automatically.
+
+## Recurring schedules
+
+Create a bounded recurring schedule with `every`:
+
+```sh
+timer every 2m \
+  --until 30m \
+  --key deploy-check \
+  --message "Read deployment status. Act only if it failed." \
+  --ref thread:THREAD_ID \
+  --json
+```
+
+The schedule emits durable `tick` events until its `--until` window ends. Cancel it with:
+
+```sh
+timer cancel --key deploy-check
+```
+
+Recurring ticks are materialized by the daemon, `claim`, `pending`, `drain`, JSON event following, or multi-timer waits. If several ticks are overdue, one refresh emits at most 100 and a later refresh continues the catch-up.
+
+## Namespaces and ownership
+
+Namespaces separate timers that use the same key or label. Owners protect cancellation and renaming:
+
+```sh
+timer start 10m --key rice --namespace agent:cook --owner codex --json
+timer list --namespace agent:cook --owner codex --mine --json
+timer cancel --key rice --namespace agent:cook --owner codex --json
+```
+
+`TIMER_NAMESPACE` and `TIMER_OWNER` set defaults. `cancel` and `rename` require the matching owner unless `--force` is supplied.
+
+## Storage and compaction
+
+Default storage:
+
+| Data | Path |
+| --- | --- |
+| Timer, stopwatch, and recurring state | `~/.local/share/timer/timers.json` |
+| Event log | `~/.local/share/timer/events.jsonl` |
+| Consumer cursors and leases | `~/.local/share/timer/consumers.json` |
+
+Override the paths with `TIMER_STATE`, `TIMER_EVENTS`, and `TIMER_CONSUMERS`. When `TIMER_EVENTS` points to a shared log, state files use the same default consumer registry so compaction sees every registered consumer.
+
+Remove the event-log prefix consumed by every registered consumer:
 
 ```sh
 timer compact --json
 ```
 
-Compaction stops at the oldest consumer cursor and also prunes terminal timer records whose terminal event is safely beyond that boundary. Its journal repairs cursor offsets after an interrupted log replacement. A forgotten consumer intentionally prevents removal; use stable, purposeful consumer names.
+Compaction stops at the oldest cursor. It also removes terminal timer and recurring-schedule records whose terminal events are safely inside the consumed prefix, plus stopped stopwatch records when events are removed. A journal repairs cursor offsets if compaction is interrupted after replacing the log. A registered consumer that never advances will prevent older events from being removed.
 
-## Tests
+## Development
+
+Run the test suite:
 
 ```sh
 python3 -m unittest discover -s tests -v
 ```
+
+Build the wheel and source archive with [uv](https://docs.astral.sh/uv/):
+
+```sh
+uv build
+```
+
+The GitHub workflow tests Python 3.10 and 3.14 on macOS.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
