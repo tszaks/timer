@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-timer"
+version = "0.3.0"
+description = "Persistent local timers and stopwatches designed for command-line agents"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+
+[project.scripts]
+timer = "agent_timer.cli:main"
+agent-timer = "agent_timer.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
