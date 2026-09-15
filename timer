@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run Agent Timer directly from this project, including through a symlink."""
+"""Run Timer directly from this project, including through a symlink."""
 
 from pathlib import Path
 import sys
@@ -8,7 +8,7 @@ import sys
 PROJECT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_DIR / "src"))
 
-from agent_timer.cli import main  # noqa: E402
+from timer_cli.cli import main  # noqa: E402
 
 
 raise SystemExit(main())

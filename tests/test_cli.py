@@ -11,14 +11,14 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CLI = ROOT / "agent-timer"
+CLI = ROOT / "timer"
 
 
-class AgentTimerTests(unittest.TestCase):
+class TimerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.env = dict(os.environ)
-        self.env["AGENT_TIMER_STATE"] = str(Path(self.temp.name) / "timers.json")
+        self.env["TIMER_STATE"] = str(Path(self.temp.name) / "timers.json")
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -49,7 +49,7 @@ class AgentTimerTests(unittest.TestCase):
         status = json.loads(self.run_cli("status", started["id"][:8], "--json").stdout)
 
         self.assertEqual(status["id"], started["id"])
-        self.assertTrue(Path(self.env["AGENT_TIMER_STATE"]).is_file())
+        self.assertTrue(Path(self.env["TIMER_STATE"]).is_file())
 
     def test_wait_returns_expiration_event(self) -> None:
         started = json.loads(self.run_cli("start", "0.1s", "--label", "test", "--json").stdout)
@@ -89,7 +89,7 @@ class AgentTimerTests(unittest.TestCase):
                 {"id": "abc222", "label": "two", "status": "active", "created_at": 2, "due_at": 9999999999},
             ]
         }
-        Path(self.env["AGENT_TIMER_STATE"]).write_text(json.dumps(state), encoding="utf-8")
+        Path(self.env["TIMER_STATE"]).write_text(json.dumps(state), encoding="utf-8")
 
         ambiguous = self.run_cli("status", "abc", expected=2)
         invalid_poll = self.run_cli("wait", "abc111", "--poll-interval", "0", expected=2)
@@ -190,7 +190,7 @@ class AgentTimerTests(unittest.TestCase):
         self.assertIn("15m 00s remaining", minutes)
         self.assertIn("1h 05m 00s remaining", hours)
 
-        state_path = Path(self.env["AGENT_TIMER_STATE"])
+        state_path = Path(self.env["TIMER_STATE"])
         state = json.loads(state_path.read_text(encoding="utf-8"))
         minute_timer = next(item for item in state["timers"] if item["label"] == "minutes")
         minute_timer["due_at"] = time.time() + 58.2
@@ -200,7 +200,7 @@ class AgentTimerTests(unittest.TestCase):
 
     def test_watch_is_read_only_and_handles_interrupt(self) -> None:
         self.run_cli("15m", "watch-me")
-        state_path = Path(self.env["AGENT_TIMER_STATE"])
+        state_path = Path(self.env["TIMER_STATE"])
         before = state_path.read_bytes()
         before_mtime = state_path.stat().st_mtime_ns
         snapshot = self.run_cli("watch", "--once").stdout
@@ -286,11 +286,11 @@ class AgentTimerTests(unittest.TestCase):
     def test_rename_preserves_deadline_and_enforces_uniqueness(self) -> None:
         first = json.loads(self.run_cli("10m", "first", "--json").stdout)
         self.run_cli("20m", "second")
-        before = json.loads(Path(self.env["AGENT_TIMER_STATE"]).read_text(encoding="utf-8"))
+        before = json.loads(Path(self.env["TIMER_STATE"]).read_text(encoding="utf-8"))
         before_due = next(item["due_at"] for item in before["timers"] if item["id"] == first["id"])
 
         renamed = json.loads(self.run_cli("rename", "first", "renamed", "--json").stdout)
-        after = json.loads(Path(self.env["AGENT_TIMER_STATE"]).read_text(encoding="utf-8"))
+        after = json.loads(Path(self.env["TIMER_STATE"]).read_text(encoding="utf-8"))
         after_due = next(item["due_at"] for item in after["timers"] if item["id"] == first["id"])
         self.assertEqual(renamed["label"], "renamed")
         self.assertEqual(before_due, after_due)

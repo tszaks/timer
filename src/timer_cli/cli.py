@@ -42,12 +42,12 @@ def parse_duration(value: str) -> float:
 
 
 def state_path() -> Path:
-    override = os.environ.get("AGENT_TIMER_STATE")
+    override = os.environ.get("TIMER_STATE")
     if override:
         return Path(override).expanduser()
     data_home = os.environ.get("XDG_DATA_HOME")
     base = Path(data_home).expanduser() if data_home else Path.home() / ".local" / "share"
-    return base / "agent-timer" / "timers.json"
+    return base / "timer" / "timers.json"
 
 
 @contextmanager

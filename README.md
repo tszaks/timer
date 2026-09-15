@@ -1,6 +1,6 @@
-# Agent Timer
+# Timer
 
-Agent Timer is a Python 3.10+ local timer and stopwatch CLI designed for tools such as Codex. It has no third-party runtime dependencies. State is persistent, so timers and stopwatches survive terminal interruptions and Mac sleep. A waiting command completes when a timer expires, which gives an agent a direct wake-up event.
+Timer is a Python 3.10+ local timer and stopwatch CLI. It has no third-party runtime dependencies. State is persistent, so timers and stopwatches survive terminal interruptions and Mac sleep. A waiting command completes when a timer expires, which also makes it useful for command-line agents such as Codex.
 
 ## Five useful commands
 
@@ -74,18 +74,18 @@ timer stopwatch list --all
 Clone the repository, then install it for your user:
 
 ```sh
-git clone https://github.com/tszaks/agent-timer.git
-cd agent-timer
+git clone https://github.com/tszaks/timer.git
+cd timer
 python3 -m pip install --user .
 ```
 
-The primary command is `timer`. The older `agent-timer` command remains available as a backwards-compatible advanced alias. You can also run the checked-out `./agent-timer` launcher directly without installing.
+The command is `timer`. You can also run the checked-out `./timer` launcher directly without installing.
 
 The original explicit grammar remains supported when an agent needs it:
 
 ```sh
-agent-timer start 10m --label rice --json
-agent-timer status rice --json
+timer start 10m --label rice --json
+timer status rice --json
 ```
 
 ## How Codex uses the wake-up
@@ -95,7 +95,7 @@ agent-timer status rice --json
 3. Yield the command session while other work continues.
 4. When the command completes, the JSON event tells Codex that the timer expired.
 
-The `wait` process does not own the timer. The timestamp remains in the state file, so another process can inspect or cancel it at any time. By default, timer and stopwatch state is stored in `~/.local/share/agent-timer/timers.json`; set `AGENT_TIMER_STATE` to choose another location.
+The `wait` process does not own the timer. The timestamp remains in the state file, so another process can inspect or cancel it at any time. By default, timer and stopwatch state is stored in `~/.local/share/timer/timers.json`; set `TIMER_STATE` to choose another location.
 
 `wait` exits with status 0 after expiration. If the timer is cancelled, it prints the cancelled timer and exits with status 2, allowing an agent to distinguish cancellation from a wake-up.
 

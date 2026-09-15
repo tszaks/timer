@@ -3,15 +3,14 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "agent-timer"
+name = "timer"
 version = "0.3.0"
-description = "Persistent local timers and stopwatches designed for command-line agents"
+description = "A persistent local timer and stopwatch for the command line"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 
 [project.scripts]
-timer = "agent_timer.cli:main"
-agent-timer = "agent_timer.cli:main"
+timer = "timer_cli.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
