@@ -4,6 +4,7 @@ After=default.target
 
 [Service]
 Type=simple
+Environment="TIMER_CODEX_BIN=%h/.local/bin/codex"
 ExecStart=%h/.local/bin/timer daemon --hook %h/.local/bin/timer-supervisor --namespace default
 Restart=on-failure
 RestartSec=2

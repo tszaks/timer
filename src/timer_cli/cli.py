@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -23,6 +24,8 @@ from .delivery import (
     claim_event,
     compact_events,
     drain_events,
+    forget_consumer,
+    list_consumers,
     nack_event,
     peek_events,
 )
@@ -36,11 +39,13 @@ from .scheduler import (
     read_events,
     schema_document,
 )
+from .service import ServiceError, install_service, service_status, uninstall_service
 
 DURATION_RE = re.compile(r"(?i)(\d+(?:\.\d+)?)(h|m|s)")
 TOP_LEVEL_COMMANDS = {
     "start", "list", "status", "cancel", "rename", "wait", "watch", "pending", "drain",
-    "claim", "ack", "nack", "compact", "daemon", "every", "schema", "stopwatch", "-h", "--help",
+    "claim", "ack", "nack", "consumers", "forget", "compact", "daemon", "setup", "service",
+    "every", "schema", "stopwatch", "-h", "--help",
 }
 
 REF_RE = re.compile(r"^(session|thread|task):.+$")
@@ -902,6 +907,36 @@ def command_nack(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_consumers(args: argparse.Namespace) -> int:
+    consumers = list_consumers(state_path())
+    payload = {
+        "ok": True,
+        "schema": "timer.consumers.v1",
+        "event": "listed",
+        "consumers": consumers,
+    }
+    if args.json:
+        print(json.dumps(payload, separators=(",", ":")))
+    elif not consumers:
+        print("No consumers.")
+    else:
+        for consumer in consumers:
+            filters = consumer["filters"]
+            scope = filters.get("namespace", "default")
+            lease = f', lease {consumer["lease"]}' if consumer["lease"] != "none" else ""
+            print(f'{consumer["name"]}: {consumer["lag_bytes"]} bytes behind in {scope}{lease}')
+    return 0
+
+
+def command_forget(args: argparse.Namespace) -> int:
+    result = forget_consumer(state_path(), consumer=args.consumer, force=args.force)
+    payload = {"ok": True, "schema": "timer.consumers.v1", **result}
+    print(json.dumps(payload, separators=(",", ":"))) if args.json else print(
+        f'{args.consumer}: forgotten'
+    )
+    return 0
+
+
 def command_compact(args: argparse.Namespace) -> int:
     result = compact_events(state_path())
     removed = set(result.pop("removed_event_ids"))
@@ -940,9 +975,12 @@ def command_compact(args: argparse.Namespace) -> int:
         "series_pruned": pruned_series,
         "stopwatches_pruned": pruned_stopwatches,
     }
-    print(json.dumps(payload, separators=(",", ":"))) if args.json else print(
-        f'compacted {payload["events_removed"]} events and {payload["bytes_removed"]} bytes'
-    )
+    if args.json:
+        print(json.dumps(payload, separators=(",", ":")))
+    else:
+        print(f'compacted {payload["events_removed"]} events and {payload["bytes_removed"]} bytes')
+        if payload.get("blockers"):
+            print(f'retained events are pinned by: {", ".join(payload["blockers"])}')
     return 0
 
 
@@ -1038,43 +1076,94 @@ def deliver_consumer(
 
 
 def command_daemon(args: argparse.Namespace) -> int:
-    try:
-        while True:
-            with locked_state() as (state, _):
-                refresh_all(state)
-                acknowledged = set(state.get("daemon_delivered_event_ids", []))
-            errors: list[Exception] = []
-            if args.hook:
-                hook = str(Path(args.hook).expanduser().resolve())
-                try:
-                    deliver_consumer(
-                        args,
-                        consumer=f"daemon-hook:{hook}",
-                        mode="hook",
-                        target=hook,
-                        acknowledged_event_ids=acknowledged,
-                    )
-                except (OSError, TimerError) as error:
-                    errors.append(error)
-            if args.wake_dir:
-                wake_dir = str(Path(args.wake_dir).expanduser().resolve())
-                try:
-                    deliver_consumer(
-                        args,
-                        consumer=f"wake-dir:{wake_dir}",
-                        mode="wake-dir",
-                        target=wake_dir,
-                        acknowledged_event_ids=acknowledged,
-                    )
-                except (OSError, TimerError) as error:
-                    errors.append(error)
-            if errors:
-                raise errors[0]
-            if args.once:
-                return 0
-            time.sleep(args.poll_interval)
-    except KeyboardInterrupt:
-        return 0
+    with daemon_lock(namespace_for(args)):
+        try:
+            while True:
+                with locked_state() as (state, _):
+                    refresh_all(state)
+                    acknowledged = set(state.get("daemon_delivered_event_ids", []))
+                errors: list[Exception] = []
+                if args.hook:
+                    hook = str(Path(args.hook).expanduser().resolve())
+                    try:
+                        deliver_consumer(
+                            args,
+                            consumer=f"daemon-hook:{hook}",
+                            mode="hook",
+                            target=hook,
+                            acknowledged_event_ids=acknowledged,
+                        )
+                    except (OSError, TimerError) as error:
+                        errors.append(error)
+                if args.wake_dir:
+                    wake_dir = str(Path(args.wake_dir).expanduser().resolve())
+                    try:
+                        deliver_consumer(
+                            args,
+                            consumer=f"wake-dir:{wake_dir}",
+                            mode="wake-dir",
+                            target=wake_dir,
+                            acknowledged_event_ids=acknowledged,
+                        )
+                    except (OSError, TimerError) as error:
+                        errors.append(error)
+                if errors:
+                    raise errors[0]
+                if args.once:
+                    return 0
+                time.sleep(args.poll_interval)
+        except KeyboardInterrupt:
+            return 0
+
+
+@contextmanager
+def daemon_lock(namespace: str) -> Iterator[None]:
+    identity = hashlib.sha256(namespace.encode()).hexdigest()[:16]
+    lock_path = state_path().with_name(f"daemon-{identity}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            handle.seek(0)
+            holder = handle.read().strip()
+            detail = f" (pid {holder})" if holder else ""
+            raise TimerError("busy", f'daemon already running for namespace "{namespace}"{detail}') from error
+        handle.seek(0)
+        handle.truncate()
+        handle.write(str(os.getpid()))
+        handle.flush()
+        yield
+
+
+def command_setup(args: argparse.Namespace) -> int:
+    timer_bin = str(Path(sys.argv[0]).expanduser().resolve())
+    payload = install_service(
+        state_path(),
+        timer_bin=timer_bin,
+        namespace=namespace_for(args),
+        dry_run=args.dry_run,
+    )
+    print(json.dumps(payload, separators=(",", ":"))) if args.json else print(
+        f'{payload["event"]} {payload["platform"]} service at {payload["path"]}'
+    )
+    return 0
+
+
+def command_service_status(args: argparse.Namespace) -> int:
+    payload = service_status()
+    print(json.dumps(payload, separators=(",", ":"))) if args.json else print(
+        f'{payload["platform"]}: installed={str(payload["installed"]).lower()} running={str(payload["running"]).lower()}'
+    )
+    return 0
+
+
+def command_service_uninstall(args: argparse.Namespace) -> int:
+    payload = uninstall_service()
+    print(json.dumps(payload, separators=(",", ":"))) if args.json else print(
+        f'{payload["event"]}: {payload["path"]}'
+    )
+    return 0
 
 
 def command_schema(args: argparse.Namespace) -> int:
@@ -1084,6 +1173,14 @@ def command_schema(args: argparse.Namespace) -> int:
         "events": ["claimed", "busy", "empty", "acked", "already_acked", "nacked"],
         "claimed_required": ["consumer", "lease_id", "lease_until", "delivery"],
         "ack_input_required": ["consumer", "event_id", "lease_id"],
+    }
+    document["agent_recipe"] = [
+        "timer start DURATION --key KEY --ref thread:THREAD_ID --message MESSAGE --json",
+        "timer claim --consumer NAME --event expired --json",
+        "timer ack EVENT_ID --consumer NAME --lease-id LEASE_ID --json",
+    ]
+    document["warnings"] = {
+        "drain": "scripts only: drain acknowledges each event before caller work begins",
     }
     print(json.dumps(document, indent=None if args.json else 2, separators=(",", ":") if args.json else None))
     return 0
@@ -1286,6 +1383,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = TimerArgumentParser(
         prog=Path(sys.argv[0]).name,
         description="Persistent timers and stopwatches for the command line",
+        epilog=(
+            "Agent recipe: start with --key and --ref, claim one event with a stable --consumer, "
+            "finish the work, then ack that event and lease. Run `timer schema` for exact commands."
+        ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -1344,9 +1445,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     for name, function, help_text in (
         ("pending", command_pending, "peek at unacknowledged timer events"),
-        ("drain", command_drain, "return and acknowledge timer events"),
+        ("drain", command_drain, "scripts only: return and acknowledge events before caller work"),
     ):
-        inbox = subparsers.add_parser(name, help=help_text)
+        inbox = subparsers.add_parser(name, help=help_text, description=help_text)
         inbox.add_argument("--event", dest="event_type", choices=("started", "expired", "cancelled", "lap", "tick"))
         inbox.add_argument("--consumer", help="independent delivery cursor; defaults to a legacy cursor")
         inbox.add_argument("--json", action="store_true")
@@ -1369,6 +1470,16 @@ def build_parser() -> argparse.ArgumentParser:
         delivery.add_argument("--json", action="store_true")
         delivery.set_defaults(func=function)
 
+    consumers = subparsers.add_parser("consumers", help="list delivery consumers and retained-log lag")
+    consumers.add_argument("--json", action="store_true")
+    consumers.set_defaults(func=command_consumers)
+
+    forget = subparsers.add_parser("forget", help="remove a named delivery consumer")
+    forget.add_argument("consumer", help="exact consumer name from `timer consumers`")
+    forget.add_argument("--force", action="store_true", help="remove even when its lease is active")
+    forget.add_argument("--json", action="store_true")
+    forget.set_defaults(func=command_forget)
+
     compact = subparsers.add_parser("compact", help="truncate events consumed by every delivery path")
     compact.add_argument("--json", action="store_true")
     compact.set_defaults(func=command_compact)
@@ -1383,6 +1494,21 @@ def build_parser() -> argparse.ArgumentParser:
     daemon.add_argument("--json", action="store_true")
     add_scope_arguments(daemon)
     daemon.set_defaults(func=command_daemon)
+
+    setup = subparsers.add_parser("setup", help="install and validate the user wake service")
+    setup.add_argument("--dry-run", action="store_true", help="validate dependencies and one synthetic expiry only")
+    setup.add_argument("--json", action="store_true")
+    add_scope_arguments(setup)
+    setup.set_defaults(func=command_setup)
+
+    service = subparsers.add_parser("service", help="inspect or remove the user wake service")
+    service_commands = service.add_subparsers(dest="service_command", required=True)
+    service_status_parser = service_commands.add_parser("status", help="show installation and process status")
+    service_status_parser.add_argument("--json", action="store_true")
+    service_status_parser.set_defaults(func=command_service_status)
+    service_uninstall_parser = service_commands.add_parser("uninstall", help="stop and remove the user service")
+    service_uninstall_parser.add_argument("--json", action="store_true")
+    service_uninstall_parser.set_defaults(func=command_service_uninstall)
 
     every = subparsers.add_parser("every", help="schedule recurring heartbeat events")
     every.add_argument("interval", help="tick interval such as 2m")
@@ -1485,7 +1611,7 @@ def main(argv: list[str] | None = None) -> int:
         return args.func(args)
     except (ValueError, KeyError, json.JSONDecodeError) as error:
         message = error.args[0] if error.args else str(error)
-        if isinstance(error, (TimerError, DeliveryError)):
+        if isinstance(error, (TimerError, DeliveryError, ServiceError)):
             code = error.code
         elif isinstance(error, KeyError):
             code = "not_found"

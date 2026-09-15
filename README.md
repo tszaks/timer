@@ -2,7 +2,7 @@
 
 [![Tests](https://github.com/tszaks/timer/actions/workflows/test.yml/badge.svg)](https://github.com/tszaks/timer/actions/workflows/test.yml)
 
-Timer is a persistent timer, stopwatch, and deferred-work CLI for Unix systems. Version 0.5.0 requires Python 3.10 or newer and has no third-party runtime dependencies.
+Timer is a persistent timer, stopwatch, and deferred-work CLI for Unix systems. Version 0.6.0 requires Python 3.10 or newer and has no third-party runtime dependencies.
 
 Timer stores absolute deadlines on disk. Timers and stopwatches survive terminal exits and system sleep. An expiration is processed the next time a Timer command refreshes state, or shortly after its deadline when the optional daemon is running.
 
@@ -24,6 +24,18 @@ This installs two commands:
 - `timer-supervisor` converts a Timer event into a queued Codex turn.
 
 You can also run `./timer` directly from the repository without installing it.
+
+To validate and install the Codex wake service for your user account:
+
+```sh
+timer setup --dry-run
+timer setup
+timer service status
+```
+
+Setup supports macOS launchd and Linux systemd user services. It refuses cleanly if `codex queue` or `timer-supervisor` is unavailable. Before writing or starting a service, it sends one synthetic expiry through `timer-supervisor --dry-run`. The synthetic expiry never enters the Codex queue. After activation, setup also verifies that the service manager reports the daemon as running.
+
+The installed service starts its consumer at the current end of the retained log. Old events are not replayed during first-time setup. If that exact consumer already exists, setup preserves its cursor.
 
 ## Start a timer
 
@@ -105,6 +117,8 @@ timer schema --json
 
 ## Durable work for agents
 
+Agents should use one recipe: start a keyed timer, claim one expiry, complete the work, then acknowledge that exact lease.
+
 Use a keyed timer when an agent needs to continue work later:
 
 ```sh
@@ -175,13 +189,13 @@ Each new consumer starts at the beginning of the retained event log. Each consum
 timer pending --consumer inspector --event expired --json
 ```
 
-`drain` returns and acknowledges all matching events:
+`drain` is for simple scripts. It returns and acknowledges all matching events before the caller starts work:
 
 ```sh
 timer drain --consumer simple-script --event expired --json
 ```
 
-Do not use `drain` for work that must survive a crash between receipt and completion. Use `claim`, then `ack` or `nack`.
+Do not use `drain` for agent work or any work that must survive a crash between receipt and completion. Use `claim`, then `ack` or `nack`.
 
 Without `--consumer`, `pending` and `drain` use a compatibility cursor derived from their namespace, owner, and event filter.
 
@@ -216,13 +230,15 @@ timer daemon --hook /absolute/path/to/hook --wake-dir /absolute/path/to/wake-dir
 
 Hooks run directly without a shell and receive one raw `timer.event.v1` JSON object on standard input. Wake files are written atomically, one file per event. Hook and wake-directory delivery use independent consumer cursors, so one path does not consume the other path's event. A new hook path or wake-directory path receives matching events still retained in the log. A failed path is released for retry after the other path has had a chance to run.
 
+Only one daemon can run for a state file and namespace. A second process exits with a `busy` error and reports the first process ID when available.
+
 Run one refresh pass and exit with:
 
 ```sh
 timer daemon --once --wake-dir /absolute/path/to/wake-directory
 ```
 
-Installing Timer does not start the daemon. The repository contains service templates for [launchd](examples/launchd/com.tszaks.timer-supervisor.plist) and [systemd](examples/systemd/timer-supervisor.service). Replace their placeholders and paths before installing them.
+Installing the Python package does not start the daemon. Run `timer setup` to generate and activate a user service. The repository also contains reference templates for [launchd](examples/launchd/com.tszaks.timer-supervisor.plist) and [systemd](examples/systemd/timer-supervisor.service).
 
 ## Codex supervisor
 
@@ -296,7 +312,16 @@ Remove the event-log prefix consumed by every registered consumer:
 timer compact --json
 ```
 
-Compaction stops at the oldest cursor. It also removes terminal timer and recurring-schedule records whose terminal events are safely inside the consumed prefix, plus stopped stopwatch records when events are removed. A journal repairs cursor offsets if compaction is interrupted after replacing the log. A registered consumer that never advances will prevent older events from being removed.
+Inspect registered consumers and remove one that is no longer used:
+
+```sh
+timer consumers
+timer forget NAME
+```
+
+`timer consumers --json` reports each exact name, filter set, lease state, cursor, and retained-log lag. `timer forget` refuses to remove a consumer with an active lease unless `--force` is supplied. Reusing a forgotten name later creates a new consumer at the beginning of the retained log.
+
+Compaction stops at the oldest cursor and names every consumer that pins that boundary. If no bytes can be removed, it returns `compaction_blocked` and tells you to inspect or forget the named consumer. It also removes terminal timer and recurring-schedule records whose terminal events are safely inside the consumed prefix, plus stopped stopwatch records when events are removed. A journal repairs cursor offsets if compaction is interrupted after replacing the log.
 
 ## Development
 
@@ -312,7 +337,7 @@ Build the wheel and source archive with [uv](https://docs.astral.sh/uv/):
 uv build
 ```
 
-The GitHub workflow tests Python 3.10 and 3.14 on macOS.
+The GitHub workflow uses two jobs: Python 3.10 on Linux and Python 3.14 on macOS.
 
 ## License
 

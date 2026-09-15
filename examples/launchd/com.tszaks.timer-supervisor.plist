@@ -19,6 +19,11 @@
   <true/>
   <key>ThrottleInterval</key>
   <integer>2</integer>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>TIMER_CODEX_BIN</key>
+    <string>__CODEX_BIN__</string>
+  </dict>
   <key>StandardOutPath</key>
   <string>__LOG_DIR__/timer-supervisor.log</string>
   <key>StandardErrorPath</key>

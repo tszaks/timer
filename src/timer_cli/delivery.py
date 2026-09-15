@@ -153,6 +153,73 @@ def consumer_record(
     return record
 
 
+def seed_consumer_at_tail(
+    state_file: Path,
+    *,
+    consumer: str,
+    namespace: str,
+    owner: str | None = None,
+    event_type: str | None = None,
+) -> dict[str, Any]:
+    """Register a new delivery path without replaying the retained event log."""
+    filters = {"namespace": namespace, "owner": owner, "event_type": event_type}
+    with locked_consumers(state_file) as state:
+        existing = state["consumers"].get(consumer)
+        if existing is not None:
+            if existing.get("filters", filters) != filters:
+                raise DeliveryError(
+                    "consumer_conflict",
+                    f'consumer "{consumer}" is already bound to different filters',
+                )
+            return {"consumer": consumer, "created": False, "cursor": int(existing.get("cursor", 0))}
+        _, end = read_event_records(state_file)
+        state["consumers"][consumer] = {
+            "cursor": end,
+            "filters": filters,
+            "lease": None,
+            "legacy_skip_event_ids": [],
+        }
+        return {"consumer": consumer, "created": True, "cursor": end}
+
+
+def list_consumers(state_file: Path) -> list[dict[str, Any]]:
+    event_path = events_path(state_file)
+    event_size = event_path.stat().st_size if event_path.exists() else 0
+    now = time.time()
+    with locked_consumers(state_file) as state:
+        result = []
+        for name, record in sorted(state["consumers"].items()):
+            cursor = int(record.get("cursor", 0))
+            lease = record.get("lease")
+            item: dict[str, Any] = {
+                "name": name,
+                "cursor": cursor,
+                "lag_bytes": max(0, event_size - cursor),
+                "filters": record.get("filters", {}),
+                "lease": "active" if lease and lease.get("lease_until", 0) > now else "none",
+            }
+            if lease:
+                item["leased_event_id"] = lease.get("event_id")
+                item["lease_until"] = iso_time(lease.get("lease_until", 0))
+            result.append(item)
+        return result
+
+
+def forget_consumer(state_file: Path, *, consumer: str, force: bool = False) -> dict[str, Any]:
+    with locked_consumers(state_file) as state:
+        record = state["consumers"].get(consumer)
+        if record is None:
+            raise DeliveryError("consumer_not_found", f'consumer not found: {consumer}')
+        lease = record.get("lease")
+        if lease and lease.get("lease_until", 0) > time.time() and not force:
+            raise DeliveryError(
+                "consumer_busy",
+                f'consumer "{consumer}" has an active lease; retry after it expires or use --force',
+            )
+        del state["consumers"][consumer]
+    return {"consumer": consumer, "event": "forgotten"}
+
+
 def claim_event(
     state_file: Path,
     *,
@@ -347,16 +414,27 @@ def compact_events(state_file: Path) -> dict[str, Any]:
     if not path.exists():
         return {"bytes_removed": 0, "events_removed": 0, "consumers": 0, "removed_event_ids": []}
     with locked_consumers(state_file) as state:
-        consumers = list(state["consumers"].values())
+        named_consumers = list(state["consumers"].items())
+        consumers = [record for _, record in named_consumers]
         if not consumers:
             return {"bytes_removed": 0, "events_removed": 0, "consumers": 0, "removed_event_ids": []}
         cutoff = min(int(record.get("cursor", 0)) for record in consumers)
+        blockers = sorted(
+            name for name, record in named_consumers if int(record.get("cursor", 0)) == cutoff
+        )
         if cutoff <= 0:
+            if path.stat().st_size:
+                names = ", ".join(blockers)
+                raise DeliveryError(
+                    "compaction_blocked",
+                    f"compaction blocked by consumer(s): {names}; inspect with `timer consumers` or remove with `timer forget NAME`",
+                )
             return {
                 "bytes_removed": 0,
                 "events_removed": 0,
                 "consumers": len(consumers),
                 "removed_event_ids": [],
+                "blockers": blockers,
             }
         registry_path = consumers_path(state_file)
         journal_path = compaction_journal_path(state_file)
@@ -401,4 +479,5 @@ def compact_events(state_file: Path) -> dict[str, Any]:
             "events_removed": len(removed),
             "consumers": len(consumers),
             "removed_event_ids": [event["event_id"] for event in removed],
+            "blockers": blockers,
         }

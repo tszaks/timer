@@ -19,7 +19,11 @@ class TimerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.env = dict(os.environ)
-        for name in ("TIMER_CONSUMERS", "TIMER_EVENTS", "TIMER_NAMESPACE", "TIMER_OWNER"):
+        for name in (
+            "TIMER_CONSUMERS", "TIMER_EVENTS", "TIMER_NAMESPACE", "TIMER_OWNER",
+            "TIMER_CODEX_BIN", "TIMER_SUPERVISOR_BIN", "TIMER_SERVICE_PLATFORM",
+            "TIMER_SERVICE_PATH", "TIMER_LAUNCHCTL_BIN", "TIMER_SYSTEMCTL_BIN",
+        ):
             self.env.pop(name, None)
         self.env["TIMER_STATE"] = str(Path(self.temp.name) / "timers.json")
 
@@ -565,6 +569,137 @@ class TimerTests(unittest.TestCase):
         self.assertEqual(empty["event"], "empty")
         self.assertEqual(nacked["event"], "nacked")
         self.assertEqual(redelivered["delivery"]["event_id"], event_id)
+
+    def test_consumers_forget_and_compaction_blocker_are_visible(self) -> None:
+        self.run_cli("start", "10m", "--key", "retained")
+        self.run_cli("pending", "--consumer", "forgotten-path", "--json")
+
+        listed = json.loads(self.run_cli("consumers", "--json").stdout)
+        blocked = json.loads(self.run_cli("compact", "--json").stdout)
+        forgotten = json.loads(self.run_cli("forget", "forgotten-path", "--json").stdout)
+
+        self.assertEqual(listed["consumers"][0]["name"], "forgotten-path")
+        self.assertGreater(listed["consumers"][0]["lag_bytes"], 0)
+        self.assertEqual(blocked["error"]["code"], "compaction_blocked")
+        self.assertIn("forgotten-path", blocked["error"]["message"])
+        self.assertEqual(forgotten["event"], "forgotten")
+        self.assertEqual(json.loads(self.run_cli("consumers", "--json").stdout)["consumers"], [])
+
+    def test_forget_refuses_active_lease_without_force(self) -> None:
+        self.run_cli("start", "0.02s", "--key", "leased-consumer")
+        self.run_cli("wait", "--key", "leased-consumer", "--json")
+        self.run_cli(
+            "claim", "--consumer", "busy-consumer", "--event", "expired", "--lease", "5m", "--json"
+        )
+
+        refused = json.loads(self.run_cli("forget", "busy-consumer", "--json").stdout)
+        forced = json.loads(self.run_cli("forget", "busy-consumer", "--force", "--json").stdout)
+
+        self.assertEqual(refused["error"]["code"], "consumer_busy")
+        self.assertEqual(forced["event"], "forgotten")
+
+    def test_daemon_allows_only_one_process_per_namespace(self) -> None:
+        first = subprocess.Popen(
+            [str(CLI), "daemon", "--poll-interval", "0.05"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=self.env,
+        )
+        try:
+            time.sleep(0.1)
+            second = json.loads(self.run_cli("daemon", "--once", "--json").stdout)
+            self.assertEqual(second["error"]["code"], "busy")
+            self.assertIn("daemon already running", second["error"]["message"])
+        finally:
+            first.send_signal(signal.SIGINT)
+            _, stderr = first.communicate(timeout=2)
+            self.assertEqual(first.returncode, 0, stderr)
+
+    def make_service_fakes(self, platform: str) -> tuple[Path, Path]:
+        fake_dir = Path(self.temp.name) / "bin"
+        fake_dir.mkdir()
+        codex = fake_dir / "codex"
+        supervisor = fake_dir / "timer-supervisor"
+        controller = fake_dir / ("launchctl" if platform == "launchd" else "systemctl")
+        calls = Path(self.temp.name) / "service-calls.txt"
+        codex.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        supervisor.write_text(
+            "#!/bin/sh\nprintf '%s\\n' '{\"schema\":\"timer.next-turn.v1\"}'\n",
+            encoding="utf-8",
+        )
+        if platform == "launchd":
+            controller.write_text(
+                '#!/bin/sh\nprintf "%s\\n" "$*" >> "$TIMER_TEST_CALLS"\n'
+                'exit 0\n',
+                encoding="utf-8",
+            )
+            self.env["TIMER_LAUNCHCTL_BIN"] = str(controller)
+        else:
+            controller.write_text(
+                '#!/bin/sh\nprintf "%s\\n" "$*" >> "$TIMER_TEST_CALLS"\nexit 0\n',
+                encoding="utf-8",
+            )
+            self.env["TIMER_SYSTEMCTL_BIN"] = str(controller)
+        for executable in (codex, supervisor, controller):
+            executable.chmod(0o700)
+        self.env["TIMER_CODEX_BIN"] = str(codex)
+        self.env["TIMER_SUPERVISOR_BIN"] = str(supervisor)
+        self.env["TIMER_SERVICE_PLATFORM"] = platform
+        self.env["TIMER_TEST_CALLS"] = str(calls)
+        return calls, supervisor
+
+    def test_setup_dry_run_checks_dependencies_without_installing(self) -> None:
+        self.make_service_fakes("launchd")
+        service_path = Path(self.temp.name) / "LaunchAgents" / "timer.plist"
+        self.env["TIMER_SERVICE_PATH"] = str(service_path)
+
+        result = json.loads(self.run_cli("setup", "--dry-run", "--json").stdout)
+
+        self.assertEqual(result["event"], "validated")
+        self.assertEqual(result["checks"], ["codex_queue", "synthetic_expiry"])
+        self.assertFalse(service_path.exists())
+
+    def test_setup_installs_launchd_service_and_seeds_log_tail(self) -> None:
+        calls, supervisor = self.make_service_fakes("launchd")
+        service_path = Path(self.temp.name) / "LaunchAgents" / "timer.plist"
+        self.env["TIMER_SERVICE_PATH"] = str(service_path)
+        self.run_cli("start", "10m", "--key", "old-event")
+
+        result = json.loads(self.run_cli("setup", "--json").stdout)
+        consumers = json.loads(self.run_cli("consumers", "--json").stdout)["consumers"]
+
+        self.assertEqual(result["event"], "installed")
+        self.assertTrue(service_path.exists())
+        self.assertIn("bootstrap", calls.read_text(encoding="utf-8"))
+        self.assertEqual(consumers[0]["name"], f"daemon-hook:{supervisor.resolve()}")
+        self.assertEqual(consumers[0]["lag_bytes"], 0)
+
+    def test_setup_generates_and_activates_linux_user_service(self) -> None:
+        calls, supervisor = self.make_service_fakes("systemd")
+        service_path = Path(self.temp.name) / "systemd" / "timer-supervisor.service"
+        self.env["TIMER_SERVICE_PATH"] = str(service_path)
+
+        result = json.loads(self.run_cli("setup", "--json").stdout)
+        unit = service_path.read_text(encoding="utf-8")
+
+        self.assertEqual(result["platform"], "systemd")
+        self.assertIn(str(supervisor.resolve()), unit)
+        self.assertIn("--user daemon-reload", calls.read_text(encoding="utf-8"))
+        self.assertIn("--user enable --now timer-supervisor.service", calls.read_text(encoding="utf-8"))
+
+    def test_help_and_schema_show_the_safe_agent_recipe(self) -> None:
+        help_text = self.run_cli("--help").stdout
+        drain_help = self.run_cli("drain", "--help").stdout
+        schema = json.loads(self.run_cli("schema", "--json").stdout)
+
+        self.assertIn("Agent recipe", help_text)
+        self.assertIn("scripts only", help_text)
+        self.assertIn("acknowledge events before caller work", drain_help)
+        self.assertIn("start", schema["agent_recipe"][0])
+        self.assertIn("claim", schema["agent_recipe"][1])
+        self.assertIn("ack", schema["agent_recipe"][2])
+        self.assertIn("acknowledges each event before caller work", schema["warnings"]["drain"])
 
     def test_expired_lease_redelivers_same_event(self) -> None:
         self.run_cli("start", "0.05s", "--key", "lease")
