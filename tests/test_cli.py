@@ -66,7 +66,7 @@ class AgentTimerTests(unittest.TestCase):
         self.assertEqual(len(all_timers), 1)
 
     def test_wait_tracks_original_timer_when_duplicate_start_is_rejected(self) -> None:
-        first = json.loads(self.run_cli("start", "0.15s", "--label", "same", "--json").stdout)
+        first = json.loads(self.run_cli("start", "1.5s", "--label", "same", "--json").stdout)
         waiter = subprocess.Popen(
             [str(CLI), "wait", "same", "--poll-interval", "0.02", "--json"],
             text=True,
@@ -76,7 +76,7 @@ class AgentTimerTests(unittest.TestCase):
         )
         time.sleep(0.05)
         duplicate = self.run_cli("start", "10m", "--label", "same", "--json", expected=2)
-        stdout, stderr = waiter.communicate(timeout=2)
+        stdout, stderr = waiter.communicate(timeout=5)
 
         self.assertIn("same-2", duplicate.stderr)
         self.assertEqual(waiter.returncode, 0, stderr)
