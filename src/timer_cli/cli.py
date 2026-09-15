@@ -547,7 +547,7 @@ def command_stopwatch_stop(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=Path(sys.argv[0]).name,
-        description="Persistent timers and stopwatches for command-line agents",
+        description="Persistent timers and stopwatches for the command line",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
