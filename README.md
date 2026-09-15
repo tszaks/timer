@@ -71,12 +71,13 @@ timer stopwatch list --all
 
 ## Install
 
-Clone the repository, then install it for your user:
+Clone the repository, then install it as an isolated command-line app with
+[`pipx`](https://pipx.pypa.io/):
 
 ```sh
 git clone https://github.com/tszaks/timer.git
 cd timer
-python3 -m pip install --user .
+pipx install .
 ```
 
 The command is `timer`. You can also run the checked-out `./timer` launcher directly without installing.
