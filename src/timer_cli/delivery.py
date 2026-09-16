@@ -139,6 +139,11 @@ def consumer_record(
             "filters": filters,
             "lease": None,
             "legacy_skip_event_ids": legacy_skip,
+            "skipped_event_ids": [],
+            "last_error": None,
+            "consecutive_failures": 0,
+            "failure_event_id": None,
+            "last_progress_at": None,
         }
         state["consumers"][consumer] = record
         return record
@@ -151,6 +156,11 @@ def consumer_record(
     record.setdefault("filters", filters)
     record.setdefault("lease", None)
     record.setdefault("legacy_skip_event_ids", [])
+    record.setdefault("skipped_event_ids", [])
+    record.setdefault("last_error", None)
+    record.setdefault("consecutive_failures", 0)
+    record.setdefault("failure_event_id", None)
+    record.setdefault("last_progress_at", None)
     return record
 
 
@@ -179,6 +189,11 @@ def seed_consumer_at_tail(
             "filters": filters,
             "lease": None,
             "legacy_skip_event_ids": [],
+            "skipped_event_ids": [],
+            "last_error": None,
+            "consecutive_failures": 0,
+            "failure_event_id": None,
+            "last_progress_at": time.time(),
         }
         return {"consumer": consumer, "created": True, "cursor": end}
 
@@ -197,12 +212,107 @@ def list_consumers(state_file: Path) -> list[dict[str, Any]]:
                 "cursor": cursor,
                 "lag_bytes": max(0, event_size - cursor),
                 "filters": record.get("filters", {}),
-                "lease": "active" if lease and lease.get("lease_until", 0) > now else "none",
+                "lease": (
+                    "active" if lease and lease.get("lease_until", 0) > now
+                    else "expired" if lease
+                    else "none"
+                ),
+                "consecutive_failures": int(record.get("consecutive_failures", 0)),
+                "skipped_events": len(record.get("skipped_event_ids", [])),
             }
             if lease:
                 item["leased_event_id"] = lease.get("event_id")
                 item["lease_until"] = iso_time(lease.get("lease_until", 0))
+                started = float(lease.get("lease_started_at", lease.get("lease_until", now)))
+                item["lease_age_seconds"] = round(max(0, now - started), 3)
+            last_progress = record.get("last_progress_at")
+            if last_progress:
+                item["last_progress_at"] = iso_time(float(last_progress))
+                item["last_progress_age_seconds"] = round(max(0, now - float(last_progress)), 3)
+            last_error = record.get("last_error")
+            if last_error:
+                item["last_error"] = {
+                    **last_error,
+                    "at": iso_time(float(last_error["at"])),
+                    "age_seconds": round(max(0, now - float(last_error["at"])), 3),
+                }
             result.append(item)
+        return result
+
+
+def delivery_health(
+    state_file: Path,
+    *,
+    consumer: str,
+    running: bool,
+    delivery_lease: float,
+) -> dict[str, Any]:
+    """Observe whether one service consumer is making healthy delivery progress."""
+    now = time.time()
+    event_path = events_path(state_file)
+    event_size = event_path.stat().st_size if event_path.exists() else 0
+    with locked_consumers(state_file) as state:
+        record = state["consumers"].get(consumer)
+        if record is None:
+            return {
+                "consumer": consumer,
+                "delivering": False,
+                "lag_bytes": event_size,
+                "lag_shrinking": False,
+                "lease_stuck": False,
+                "consecutive_failures": 0,
+                "reason": "consumer_not_found",
+                "stall_reasons": ["consumer_not_found"],
+            }
+        cursor = int(record.get("cursor", 0))
+        lag = max(0, event_size - cursor)
+        previous_lag = record.get("health_last_lag_bytes")
+        shrinking = previous_lag is not None and lag < int(previous_lag)
+        record["health_last_lag_bytes"] = lag
+        record["health_checked_at"] = now
+        lease = record.get("lease")
+        lease_age = 0.0
+        if lease:
+            started = float(
+                lease.get("lease_started_at", float(lease.get("lease_until", now)) - delivery_lease)
+            )
+            lease_age = max(0, now - started)
+        lease_stuck = bool(lease and lease_age > delivery_lease)
+        failures = int(record.get("consecutive_failures", 0))
+        delivering = running and (lag == 0 or shrinking) and not lease_stuck and failures == 0
+        stall_reasons = []
+        if not running:
+            stall_reasons.append("process_not_running")
+        if lag > 0 and not shrinking:
+            stall_reasons.append("lag_not_shrinking")
+        if lease_stuck:
+            stall_reasons.append("lease_stuck")
+        if failures:
+            stall_reasons.append("delivery_failures")
+        result: dict[str, Any] = {
+            "consumer": consumer,
+            "delivering": delivering,
+            "lag_bytes": lag,
+            "previous_lag_bytes": previous_lag,
+            "lag_shrinking": shrinking,
+            "lease_stuck": lease_stuck,
+            "lease_age_seconds": round(lease_age, 3),
+            "consecutive_failures": failures,
+            "stall_reasons": stall_reasons,
+        }
+        if lease:
+            result["leased_event_id"] = lease.get("event_id")
+        if record.get("last_progress_at"):
+            last_progress = float(record["last_progress_at"])
+            result["last_progress_at"] = iso_time(last_progress)
+            result["last_progress_age_seconds"] = round(max(0, now - last_progress), 3)
+        if record.get("last_error"):
+            last_error = record["last_error"]
+            result["last_error"] = {
+                **last_error,
+                "at": iso_time(float(last_error["at"])),
+                "age_seconds": round(max(0, now - float(last_error["at"])), 3),
+            }
         return result
 
 
@@ -256,6 +366,10 @@ def claim_event(
                 record["legacy_skip_event_ids"] = sorted(legacy_skip)
                 record["cursor"] = next_offset
                 continue
+            skipped = set(record.get("skipped_event_ids", []))
+            if event["event_id"] in skipped:
+                record["cursor"] = next_offset
+                continue
             if not event_matches(event, filters):
                 record["cursor"] = next_offset
                 continue
@@ -268,6 +382,7 @@ def claim_event(
                 "offset": start,
                 "next_offset": next_offset,
                 "lease_until": lease_until,
+                "lease_started_at": now,
             }
             return {
                 "ok": True,
@@ -320,6 +435,10 @@ def ack_event(
         record["last_acked_event_id"] = event_id
         record["last_acked_lease_id"] = lease_id
         record["lease"] = None
+        record["last_error"] = None
+        record["consecutive_failures"] = 0
+        record["failure_event_id"] = None
+        record["last_progress_at"] = time.time()
         acknowledged = set(state.get("acknowledged_event_ids", []))
         acknowledged.add(event_id)
         state["acknowledged_event_ids"] = sorted(acknowledged)
@@ -330,6 +449,58 @@ def ack_event(
         "consumer": consumer,
         "event_id": event_id,
         "lease_id": lease_id,
+    }
+
+
+def fail_event(
+    state_file: Path,
+    *,
+    consumer: str,
+    event_id: str,
+    lease_id: str,
+    code: str,
+    message: str,
+    max_failures: int,
+) -> dict[str, Any]:
+    """Record a delivery failure and skip one poison event at the retry limit."""
+    now = time.time()
+    with locked_consumers(state_file) as state:
+        record = state["consumers"].get(consumer)
+        if record is None:
+            raise DeliveryError("consumer_not_found", f'consumer not found: {consumer}')
+        lease = record.get("lease")
+        if (
+            not lease
+            or lease["event_id"] != event_id
+            or lease.get("lease_id") != lease_id
+        ):
+            raise DeliveryError("lease_mismatch", f'event is not leased by consumer "{consumer}"')
+        failures = (
+            int(record.get("consecutive_failures", 0)) + 1
+            if record.get("failure_event_id") == event_id
+            else 1
+        )
+        error = {"code": code, "message": message, "at": now, "event_id": event_id}
+        record["last_error"] = error
+        record["consecutive_failures"] = failures
+        record["failure_event_id"] = event_id
+        dropped = failures >= max_failures
+        if dropped:
+            skipped = set(record.get("skipped_event_ids", []))
+            skipped.add(event_id)
+            record["skipped_event_ids"] = sorted(skipped)
+            record["cursor"] = lease["next_offset"]
+            record["last_progress_at"] = now
+        record["lease"] = None
+    return {
+        "ok": True,
+        "schema": CLAIM_SCHEMA,
+        "event": "dropped" if dropped else "nacked",
+        "consumer": consumer,
+        "event_id": event_id,
+        "failures": failures,
+        "max_failures": max_failures,
+        "last_error": {**error, "at": iso_time(now)},
     }
 
 
@@ -472,6 +643,9 @@ def compact_events(state_file: Path) -> dict[str, Any]:
             )
             for record in state_after["consumers"].values():
                 record["cursor"] = max(0, int(record.get("cursor", 0)) - cutoff)
+                record["skipped_event_ids"] = sorted(
+                    set(record.get("skipped_event_ids", [])) - removed_ids
+                )
                 lease = record.get("lease")
                 if lease:
                     lease["offset"] = max(0, int(lease["offset"]) - cutoff)

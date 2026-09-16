@@ -3,15 +3,17 @@ from __future__ import annotations
 import json
 import os
 import plistlib
+import shlex
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
-from .delivery import seed_consumer_at_tail
+from .delivery import delivery_health, seed_consumer_at_tail
 
 SERVICE_LABEL = "com.tszaks.timer-supervisor"
+DEFAULT_DELIVERY_LEASE = 60.0
 
 
 class ServiceError(ValueError):
@@ -72,7 +74,12 @@ def service_environment_path(*binaries: str) -> str:
 def preflight(namespace: str) -> dict[str, str]:
     codex_bin = checked_binary("TIMER_CODEX_BIN", "codex")
     supervisor_bin = checked_binary("TIMER_SUPERVISOR_BIN", "timer-supervisor")
-    run_checked([codex_bin, "queue", "--help"])
+    queue_help = run_checked([codex_bin, "queue", "--help"]).stdout
+    if "--thread" not in queue_help or "session" not in queue_help.casefold():
+        raise ServiceError(
+            "preflight_failed",
+            "codex queue must expose --thread for session UUIDs or exact session names",
+        )
     result = run_checked(
         [supervisor_bin, "--dry-run", "--codex-bin", codex_bin],
         input_text=json.dumps(synthetic_event(namespace)),
@@ -241,7 +248,29 @@ def install_service(state_file: Path, *, timer_bin: str, namespace: str, dry_run
     return result
 
 
-def service_status() -> dict[str, Any]:
+def service_hook_path(target: Path, platform: str) -> str | None:
+    if not target.exists():
+        return None
+    try:
+        if platform == "launchd":
+            arguments = plistlib.loads(target.read_bytes()).get("ProgramArguments", [])
+        else:
+            line = next(
+                line for line in target.read_text(encoding="utf-8").splitlines()
+                if line.startswith("ExecStart=")
+            )
+            arguments = shlex.split(line.removeprefix("ExecStart="))
+        index = arguments.index("--hook")
+        return str(Path(arguments[index + 1]).expanduser().resolve())
+    except (IndexError, StopIteration, ValueError, OSError, plistlib.InvalidFileException):
+        return None
+
+
+def service_status(
+    state_file: Path,
+    *,
+    delivery_lease: float = DEFAULT_DELIVERY_LEASE,
+) -> dict[str, Any]:
     platform = platform_name()
     target = service_path(platform)
     loaded = False
@@ -263,14 +292,24 @@ def service_status() -> dict[str, Any]:
             check=False,
         )
         loaded = result.returncode == 0 and result.stdout.strip() == "active"
+    hook = service_hook_path(target, platform)
+    consumer = f"daemon-hook:{hook}" if hook else "daemon-hook:unknown"
+    health = delivery_health(
+        state_file,
+        consumer=consumer,
+        running=loaded,
+        delivery_lease=delivery_lease,
+    )
+    delivering = bool(target.exists() and health["delivering"])
     return {
-        "ok": True,
+        "ok": delivering,
         "schema": "timer.service.v1",
-        "event": "status",
+        "event": "delivering" if delivering else "stalled",
         "platform": platform,
         "path": str(target),
         "installed": target.exists(),
         "running": loaded,
+        "consumer": health,
     }
 
 

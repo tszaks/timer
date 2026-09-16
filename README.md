@@ -2,7 +2,7 @@
 
 [![Tests](https://github.com/tszaks/timer/actions/workflows/test.yml/badge.svg)](https://github.com/tszaks/timer/actions/workflows/test.yml)
 
-Timer is a persistent timer, stopwatch, and deferred-work CLI for Unix systems. Version 0.7.0 requires Python 3.10 or newer and has no third-party runtime dependencies.
+Timer is a persistent timer, stopwatch, and deferred-work CLI for Unix systems. Version 0.8.0 requires Python 3.10 or newer and has no third-party runtime dependencies.
 
 Timer stores absolute deadlines on disk. Timers and stopwatches survive terminal exits and system sleep. An expiration is processed the next time a Timer command refreshes state, or shortly after its deadline when the optional daemon is running.
 
@@ -33,7 +33,7 @@ timer setup
 timer service status
 ```
 
-Setup supports macOS launchd and Linux systemd user services. It refuses cleanly if `codex queue` or `timer-supervisor` is unavailable. Before writing or starting a service, it sends one synthetic expiry through `timer-supervisor --dry-run`. The synthetic expiry never enters the Codex queue. After activation, setup also verifies that the service manager reports the daemon as running.
+Setup supports macOS launchd and Linux systemd user services. It refuses cleanly if `codex queue` or `timer-supervisor` is unavailable. It also parses `codex queue --help` and requires the installed `--thread` flag to accept session UUIDs or exact session names. Before writing or starting a service, it sends one synthetic expiry through `timer-supervisor --dry-run`. The synthetic expiry never enters the Codex queue. After activation, setup verifies that the service manager reports the daemon as running.
 
 The installed service starts its consumer at the current end of the retained log. Old events are not replayed during first-time setup. If that exact consumer already exists, setup preserves its cursor.
 
@@ -137,7 +137,7 @@ timer start 10m \
 `--payload` must be a JSON object. `--payload-file PATH` reads the same object from a file. Route references must use one of these forms:
 
 - `thread:<id>` routes directly to a Codex thread.
-- `session:<id>` routes to a Codex session through the same queue interface.
+- `session:<id>` routes through `codex queue --thread`, whose argument accepts a session UUID or exact session name.
 - `task:<id>` names logical work. To use the Codex supervisor, include `"route_ref":"thread:<id>"` or `"route_ref":"session:<id>"` in the payload.
 
 ### Claim, work, acknowledge
@@ -228,7 +228,9 @@ timer daemon --wake-dir /absolute/path/to/wake-directory
 timer daemon --hook /absolute/path/to/hook --wake-dir /absolute/path/to/wake-directory
 ```
 
-Hooks run directly without a shell and receive one raw `timer.event.v1` JSON object on standard input. Wake files are written atomically, one file per event. Hook and wake-directory delivery use independent consumer cursors, so one path does not consume the other path's event. A new hook path or wake-directory path receives matching events still retained in the log. A failed path is released for retry after the other path has had a chance to run.
+Hooks run directly without a shell and receive one raw `timer.event.v1` JSON object on standard input. Wake files are written atomically, one file per event. Hook and wake-directory delivery use independent consumer cursors, so one path does not consume the other path's event. A new hook path or wake-directory path receives matching events still retained in the log.
+
+A hook failure records its code, message, event ID, time, and consecutive-failure count on that hook's consumer. It releases the lease and keeps the daemon alive. After five failures on the same event, that consumer dead-letters the event by advancing only its own cursor; other consumers can still claim it. The daemon logs one `dropped` line and continues with later events. Change the retry bound with `--max-hook-failures N`.
 
 Only one daemon can run for a state file and namespace. A second process exits with a `busy` error and reports the first process ID when available.
 
@@ -242,7 +244,7 @@ Installing the Python package does not start the daemon. Run `timer setup` to ge
 
 ## Codex supervisor
 
-`timer-supervisor` reads one raw Timer event from standard input and queues a new Codex turn with `codex queue`. The event needs a `thread:` or `session:` route, either in `ref` or in `payload.route_ref`.
+`timer-supervisor` reads one raw Timer event from standard input and queues a new Codex turn with `codex queue`. The event needs a `thread:` or `session:` route, either in `ref` or in `payload.route_ref`. Both route kinds use the installed `codex queue --thread` argument because that argument explicitly accepts session UUIDs and exact session names; setup refuses installation when that capability is absent.
 
 Connect it to the daemon:
 
@@ -320,7 +322,9 @@ timer consumers
 timer forget NAME
 ```
 
-`timer consumers --json` reports each exact name, filter set, lease state, cursor, and retained-log lag. `timer forget` refuses to remove a consumer with an active lease unless `--force` is supplied. Reusing a forgotten name later creates a new consumer at the beginning of the retained log.
+`timer consumers --json` reports each exact name, filter set, lease state and age, leased event ID, cursor, retained-log lag, last delivery error and age, consecutive failures, last progress time, and consumer-local skipped-event count. `timer forget` refuses to remove a consumer with an active lease unless `--force` is supplied. Reusing a forgotten name later creates a new consumer at the beginning of the retained log.
+
+`timer service status` combines the service-manager process result with the installed hook consumer. It reports `event: "delivering"` only when the process is running, lag is zero or shrinking, no lease is older than the delivery-lease bound, and consecutive failures are zero. Otherwise it reports `event: "stalled"` and includes the same consumer diagnostics. A running launchd or systemd process alone is not delivery proof.
 
 Compaction stops at the oldest cursor and names every consumer that pins that boundary. If no bytes can be removed, it returns `compaction_blocked` and tells you to inspect or forget the named consumer. It also removes terminal timer and recurring-schedule records whose terminal events are safely inside the consumed prefix, plus stopped stopwatch records when events are removed. A journal repairs cursor offsets if compaction is interrupted after replacing the log.
 

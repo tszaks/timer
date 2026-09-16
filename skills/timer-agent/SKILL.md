@@ -37,4 +37,4 @@ Use one delivery recipe: `start --key`, `claim`, then `ack`.
 
 Never use `drain` for agent work. It acknowledges each event before caller work begins. Each delivery path must keep a stable consumer name; sessions that intentionally compete for the same work share that name.
 
-Before relying on automatic wake delivery, verify `timer service status` reports `running=true`. Install it with `timer setup` when needed. Setup checks `codex queue`, validates a synthetic expiry, and starts the user service.
+Before relying on automatic wake delivery, verify `timer service status --json` reports `event: "delivering"`; `running=true` alone is insufficient. Install it with `timer setup` when needed. Setup checks that `codex queue --thread` accepts session identifiers, validates a synthetic expiry, and starts the user service.

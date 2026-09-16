@@ -24,6 +24,7 @@ from .delivery import (
     claim_event,
     compact_events,
     drain_events,
+    fail_event,
     forget_consumer,
     list_consumers,
     nack_event,
@@ -982,8 +983,21 @@ def command_consumers(args: argparse.Namespace) -> int:
         for consumer in consumers:
             filters = consumer["filters"]
             scope = filters.get("namespace", "default")
-            lease = f', lease {consumer["lease"]}' if consumer["lease"] != "none" else ""
-            print(f'{consumer["name"]}: {consumer["lag_bytes"]} bytes behind in {scope}{lease}')
+            print(
+                f'{consumer["name"]}  {consumer["lag_bytes"]} bytes behind in {scope}'
+                f'  lease={consumer["lease"]}  fails={consumer["consecutive_failures"]}'
+            )
+            if consumer.get("leased_event_id"):
+                print(
+                    f'  leased_event: {consumer["leased_event_id"]}'
+                    f'  age={adaptive_time(consumer.get("lease_age_seconds", 0))}'
+                )
+            if consumer.get("last_error"):
+                error = consumer["last_error"]
+                print(
+                    f'  last_error: {error["code"]}: {error["message"]}'
+                    f'  (event {error["event_id"]}, {adaptive_time(error["age_seconds"])} ago)'
+                )
     return 0
 
 
@@ -1118,7 +1132,33 @@ def deliver_consumer(
                 run_hook(event, target, args.hook_timeout)
             else:
                 write_wake_event(event, target)
-        except (OSError, TimerError):
+        except TimerError as error:
+            if mode != "hook" or error.code != "hook_failed":
+                nack_event(
+                    state_path(),
+                    consumer=consumer,
+                    event_id=event["event_id"],
+                    lease_id=claimed["lease_id"],
+                )
+                raise
+            failure = fail_event(
+                state_path(),
+                consumer=consumer,
+                event_id=event["event_id"],
+                lease_id=claimed["lease_id"],
+                code=error.code,
+                message=str(error),
+                max_failures=args.max_hook_failures,
+            )
+            if failure["event"] == "dropped":
+                print(
+                    f'dropped {event["event_id"]} for {consumer} after '
+                    f'{failure["failures"]} failures: {error}',
+                    file=sys.stderr,
+                    flush=True,
+                )
+            return
+        except OSError:
             nack_event(
                 state_path(),
                 consumer=consumer,
@@ -1210,10 +1250,26 @@ def command_setup(args: argparse.Namespace) -> int:
 
 
 def command_service_status(args: argparse.Namespace) -> int:
-    payload = service_status()
-    print(json.dumps(payload, separators=(",", ":"))) if args.json else print(
-        f'{payload["platform"]}: installed={str(payload["installed"]).lower()} running={str(payload["running"]).lower()}'
-    )
+    payload = service_status(state_path(), delivery_lease=args.delivery_lease)
+    if args.json:
+        print(json.dumps(payload, separators=(",", ":")))
+    else:
+        status = payload["event"].upper()
+        if status == "STALLED" and sys.stdout.isatty():
+            status = f"\033[31m{status}\033[0m"
+        consumer = payload["consumer"]
+        print(
+            f'{status} {payload["platform"]}: running={str(payload["running"]).lower()}'
+            f' lag={consumer["lag_bytes"]} fails={consumer["consecutive_failures"]}'
+        )
+        if consumer.get("stall_reasons"):
+            print(f'  reasons: {", ".join(consumer["stall_reasons"])}')
+        if consumer.get("last_error"):
+            error = consumer["last_error"]
+            print(
+                f'  last_error: {error["code"]}: {error["message"]}'
+                f'  (event {error["event_id"]})'
+            )
     return 0
 
 
@@ -1550,6 +1606,7 @@ def build_parser() -> argparse.ArgumentParser:
     daemon.add_argument("--poll-interval", type=positive_float, default=0.25)
     daemon.add_argument("--hook-timeout", type=positive_float, default=30.0)
     daemon.add_argument("--delivery-lease", type=positive_float, default=60.0, help=argparse.SUPPRESS)
+    daemon.add_argument("--max-hook-failures", type=positive_int, default=5)
     daemon.add_argument("--json", action="store_true")
     add_scope_arguments(daemon)
     daemon.set_defaults(func=command_daemon)
@@ -1564,6 +1621,9 @@ def build_parser() -> argparse.ArgumentParser:
     service_commands = service.add_subparsers(dest="service_command", required=True)
     service_status_parser = service_commands.add_parser("status", help="show installation and process status")
     service_status_parser.add_argument("--json", action="store_true")
+    service_status_parser.add_argument(
+        "--delivery-lease", type=positive_float, default=60.0, help=argparse.SUPPRESS
+    )
     service_status_parser.set_defaults(func=command_service_status)
     service_uninstall_parser = service_commands.add_parser("uninstall", help="stop and remove the user service")
     service_uninstall_parser.add_argument("--json", action="store_true")

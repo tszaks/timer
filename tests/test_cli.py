@@ -413,26 +413,77 @@ class TimerTests(unittest.TestCase):
         wake_event = json.loads(wake_files[0].read_text(encoding="utf-8"))
         self.assertEqual(hook_event["event_id"], wake_event["event_id"])
 
-    def test_failed_daemon_hook_releases_claim_for_retry(self) -> None:
+    def test_failed_daemon_hook_records_error_and_daemon_stays_running(self) -> None:
         hook = Path(self.temp.name) / "retry.sh"
-        output = Path(self.temp.name) / "retried-event.json"
-        wake_dir = Path(self.temp.name) / "healthy-wake"
         hook.write_text("#!/bin/sh\nexit 7\n", encoding="utf-8")
         hook.chmod(0o700)
-        self.env["TIMER_HOOK_OUTPUT"] = str(output)
         self.run_cli("start", "0.05s", "--key", "retry-hook")
         time.sleep(0.08)
 
-        failed = self.run_cli(
-            "daemon", "--once", "--hook", str(hook), "--wake-dir", str(wake_dir), expected=2
+        daemon = subprocess.Popen(
+            [
+                str(CLI), "daemon", "--hook", str(hook), "--poll-interval", "1",
+                "--max-hook-failures", "5",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=self.env,
         )
-        self.assertIn("hook failed", failed.stderr)
-        self.assertEqual(len(list(wake_dir.glob("*.json"))), 1)
+        try:
+            time.sleep(0.2)
+            self.assertIsNone(daemon.poll())
+            consumers = json.loads(self.run_cli("consumers", "--json").stdout)["consumers"]
+            record = next(item for item in consumers if item["name"].startswith("daemon-hook:"))
+            human = self.run_cli("consumers").stdout
+            claimed = json.loads(
+                self.run_cli(
+                    "claim", "--consumer", "observer", "--event", "expired", "--json"
+                ).stdout
+            )
+            self.assertEqual(record["consecutive_failures"], 1)
+            self.assertEqual(record["last_error"]["code"], "hook_failed")
+            self.assertIn("age_seconds", record["last_error"])
+            self.assertIn("fails=1", human)
+            self.assertIn("last_error: hook_failed", human)
+            self.assertEqual(claimed["event"], "claimed")
+        finally:
+            daemon.send_signal(signal.SIGINT)
+            daemon.communicate(timeout=2)
+
+    def test_poison_hook_event_is_skipped_only_for_that_consumer(self) -> None:
+        hook = Path(self.temp.name) / "poison.sh"
+        output = Path(self.temp.name) / "delivered.json"
+        hook.write_text("#!/bin/sh\nexit 7\n", encoding="utf-8")
+        hook.chmod(0o700)
+        self.run_cli("start", "0.05s", "--key", "poison")
+        self.run_cli("start", "0.05s", "--key", "healthy")
+        time.sleep(0.08)
+
+        attempts = [
+            self.run_cli(
+                "daemon", "--once", "--hook", str(hook), "--max-hook-failures", "5"
+            )
+            for _ in range(5)
+        ]
+        self.assertIn("dropped", attempts[-1].stderr)
         hook.write_text('#!/bin/sh\ncat > "$TIMER_HOOK_OUTPUT"\n', encoding="utf-8")
+        self.env["TIMER_HOOK_OUTPUT"] = str(output)
         self.run_cli("daemon", "--once", "--hook", str(hook))
 
-        event = json.loads(output.read_text(encoding="utf-8"))
-        self.assertEqual(event["key"], "retry-hook")
+        delivered = json.loads(output.read_text(encoding="utf-8"))
+        other_consumer = json.loads(
+            self.run_cli(
+                "claim", "--consumer", "independent", "--event", "expired", "--json"
+            ).stdout
+        )
+        hook_record = next(
+            item for item in json.loads(self.run_cli("consumers", "--json").stdout)["consumers"]
+            if item["name"].startswith("daemon-hook:")
+        )
+        self.assertEqual(delivered["key"], "healthy")
+        self.assertEqual(other_consumer["delivery"]["key"], "poison")
+        self.assertEqual(hook_record["skipped_events"], 1)
 
     def test_json_domain_errors_exit_success_with_stable_schema(self) -> None:
         missing = self.run_cli("status", "--key", "missing", "--json")
@@ -654,7 +705,14 @@ class TimerTests(unittest.TestCase):
         supervisor = fake_dir / "timer-supervisor"
         controller = fake_dir / ("launchctl" if platform == "launchd" else "systemctl")
         calls = Path(self.temp.name) / "service-calls.txt"
-        codex.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        codex.write_text(
+            "#!/bin/sh\n"
+            "if [ \"$1\" = queue ] && [ \"$2\" = --help ]; then\n"
+            "  printf '%s\\n' 'Usage: codex queue --thread ID' 'Session UUID or exact session name'\n"
+            "fi\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
         supervisor.write_text(
             "#!/bin/sh\nprintf '%s\\n' '{\"schema\":\"timer.next-turn.v1\"}'\n",
             encoding="utf-8",
@@ -691,6 +749,76 @@ class TimerTests(unittest.TestCase):
         self.assertEqual(result["checks"], ["codex_queue", "synthetic_expiry"])
         self.assertFalse(service_path.exists())
 
+    def test_setup_rejects_queue_without_session_capable_thread_flag(self) -> None:
+        self.make_service_fakes("launchd")
+        codex = Path(self.env["TIMER_CODEX_BIN"])
+        codex.write_text("#!/bin/sh\nprintf '%s\\n' 'Usage: codex queue --thread ID'\n", encoding="utf-8")
+
+        result = json.loads(self.run_cli("setup", "--dry-run", "--json").stdout)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"]["code"], "preflight_failed")
+
+    def test_service_status_is_stalled_when_running_hook_consumer_has_failed(self) -> None:
+        _, supervisor = self.make_service_fakes("launchd")
+        service_path = Path(self.temp.name) / "LaunchAgents" / "timer.plist"
+        self.env["TIMER_SERVICE_PATH"] = str(service_path)
+        self.run_cli("setup", "--json")
+        supervisor.write_text("#!/bin/sh\nexit 7\n", encoding="utf-8")
+        self.run_cli("start", "0.05s", "--key", "stalled")
+        time.sleep(0.08)
+        self.run_cli("daemon", "--once", "--hook", str(supervisor))
+
+        status = json.loads(self.run_cli("service", "status", "--json").stdout)
+
+        self.assertEqual(status["event"], "stalled")
+        self.assertTrue(status["running"])
+        self.assertGreater(status["consumer"]["lag_bytes"], 0)
+        self.assertEqual(status["consumer"]["last_error"]["code"], "hook_failed")
+
+    def test_service_status_is_stalled_when_lag_grows_while_process_runs(self) -> None:
+        self.make_service_fakes("launchd")
+        service_path = Path(self.temp.name) / "LaunchAgents" / "timer.plist"
+        self.env["TIMER_SERVICE_PATH"] = str(service_path)
+        self.run_cli("setup", "--json")
+        healthy = json.loads(self.run_cli("service", "status", "--json").stdout)
+        self.run_cli("start", "10m", "--key", "new-lag")
+
+        stalled = json.loads(self.run_cli("service", "status", "--json").stdout)
+
+        self.assertEqual(healthy["event"], "delivering")
+        self.assertEqual(stalled["event"], "stalled")
+        self.assertTrue(stalled["running"])
+        self.assertIn("lag_not_shrinking", stalled["consumer"]["stall_reasons"])
+
+    def test_service_status_is_stalled_when_delivery_lease_is_stuck(self) -> None:
+        _, supervisor = self.make_service_fakes("launchd")
+        service_path = Path(self.temp.name) / "LaunchAgents" / "timer.plist"
+        self.env["TIMER_SERVICE_PATH"] = str(service_path)
+        self.run_cli("setup", "--json")
+        registry_path = Path(self.temp.name) / "consumers.json"
+        registry = json.loads(registry_path.read_text(encoding="utf-8"))
+        record = registry["consumers"][f"daemon-hook:{supervisor.resolve()}"]
+        record["lease"] = {
+            "lease_id": "stuck-lease",
+            "event_id": "stuck-event",
+            "offset": record["cursor"],
+            "next_offset": record["cursor"],
+            "lease_started_at": time.time() - 10,
+            "lease_until": time.time() + 60,
+        }
+        registry_path.write_text(json.dumps(registry), encoding="utf-8")
+
+        status = json.loads(
+            self.run_cli(
+                "service", "status", "--delivery-lease", "1", "--json"
+            ).stdout
+        )
+
+        self.assertEqual(status["event"], "stalled")
+        self.assertTrue(status["consumer"]["lease_stuck"])
+        self.assertEqual(status["consumer"]["leased_event_id"], "stuck-event")
+
     def test_setup_installs_launchd_service_and_seeds_log_tail(self) -> None:
         calls, supervisor = self.make_service_fakes("launchd")
         service_path = Path(self.temp.name) / "LaunchAgents" / "timer.plist"
@@ -699,6 +827,7 @@ class TimerTests(unittest.TestCase):
 
         result = json.loads(self.run_cli("setup", "--json").stdout)
         consumers = json.loads(self.run_cli("consumers", "--json").stdout)["consumers"]
+        health = json.loads(self.run_cli("service", "status", "--json").stdout)
 
         self.assertEqual(result["event"], "installed")
         self.assertTrue(service_path.exists())
@@ -706,6 +835,7 @@ class TimerTests(unittest.TestCase):
         self.assertIn("PATH", service_path.read_text(encoding="utf-8"))
         self.assertEqual(consumers[0]["name"], f"daemon-hook:{supervisor.resolve()}")
         self.assertEqual(consumers[0]["lag_bytes"], 0)
+        self.assertEqual(health["event"], "delivering")
 
     def test_setup_generates_and_activates_linux_user_service(self) -> None:
         calls, supervisor = self.make_service_fakes("systemd")
@@ -974,6 +1104,28 @@ class TimerTests(unittest.TestCase):
         self.assertEqual(arguments[3], "--message")
         self.assertIn("timer.next-turn.v1", "\n".join(arguments[4:]))
         self.assertEqual(queued["event"], "queued")
+
+    def test_reference_supervisor_routes_session_through_session_capable_thread_flag(self) -> None:
+        event = {
+            "schema": "timer.event.v1",
+            "event_id": "event-session",
+            "event": "expired",
+            "id": "timer-session",
+            "key": "session-check",
+            "timestamp": "2026-09-16T08:00:00-04:00",
+            "ref": "session:session-123",
+        }
+        fake_codex = Path(self.temp.name) / "codex"
+        captured = Path(self.temp.name) / "session-args.txt"
+        fake_codex.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$SUPERVISOR_ARGS"\n', encoding="utf-8")
+        fake_codex.chmod(0o700)
+        self.env["SUPERVISOR_ARGS"] = str(captured)
+
+        result = json.loads(self.run_supervisor(event, "--codex-bin", str(fake_codex)).stdout)
+        arguments = captured.read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual(result["event"], "queued")
+        self.assertEqual(arguments[:3], ["queue", "--thread", "session-123"])
 
     def test_reference_supervisor_rejects_malformed_route_without_traceback(self) -> None:
         event = {
