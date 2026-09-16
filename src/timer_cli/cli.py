@@ -28,6 +28,7 @@ from .delivery import (
     list_consumers,
     nack_event,
     peek_events,
+    unacknowledged_series_ticks,
 )
 from .scheduler import (
     TIMER_SCHEMA,
@@ -236,6 +237,7 @@ def public_timer(
         "ok": True,
         "schema": TIMER_SCHEMA,
         "event": event,
+        "kind": "timer",
         "id": timer["id"],
         "key": timer.get("key") or timer["label"],
         "label": timer["label"],
@@ -292,9 +294,13 @@ def emit(payload: Any, as_json: bool) -> None:
         if not payload:
             print("No timers.")
         for timer in payload:
-            print(human_timer(timer))
+            print(human_status(timer))
         return
-    print(human_timer(payload))
+    print(human_status(payload))
+
+
+def human_status(item: dict[str, Any]) -> str:
+    return human_series(item) if item.get("kind") == "series" else human_timer(item)
 
 
 def human_timer(timer: dict[str, Any]) -> str:
@@ -441,7 +447,7 @@ def find_series(state: dict[str, Any], identifier: str, namespace: str) -> dict[
     if exact:
         return exact[0]
     keyed = [item for item in series if item["key"].casefold() == identifier.casefold()]
-    active = [item for item in keyed if item["status"] == "active"]
+    active = [item for item in keyed if item["status"] in {"active", "paused"}]
     if len(active) == 1:
         return active[0]
     if len(active) > 1:
@@ -456,6 +462,7 @@ def public_series(series: dict[str, Any], *, event: str = "status") -> dict[str,
         "ok": True,
         "schema": TIMER_SCHEMA,
         "event": event,
+        "kind": "series",
         "id": series["id"],
         "key": series["key"],
         "label": series["label"],
@@ -464,6 +471,8 @@ def public_series(series: dict[str, Any], *, event: str = "status") -> dict[str,
         "until_at": iso_time(series["until_at"]),
         "next_at": iso_time(series["next_at"]),
         "tick_count": series["tick_count"],
+        "unacknowledged_ticks": series.get("unacknowledged_ticks", 0),
+        "max_unacknowledged_ticks": series.get("max_unacknowledged_ticks", 3),
         "namespace": series.get("namespace", "default"),
         "owner": series.get("owner", "local"),
     }
@@ -472,7 +481,22 @@ def public_series(series: dict[str, Any], *, event: str = "status") -> dict[str,
             result[field] = series[field]
     if series.get("payload") is not None:
         result["payload"] = series["payload"]
+    if series.get("pause_reason") is not None:
+        result["pause_reason"] = series["pause_reason"]
     return result
+
+
+def human_series(series: dict[str, Any]) -> str:
+    interval = adaptive_time(series["interval_seconds"])
+    pending = series.get("unacknowledged_ticks", 0)
+    limit = series.get("max_unacknowledged_ticks", 3)
+    if series["status"] == "paused":
+        return f'{series["label"]}: every {interval}, paused at {pending}/{limit} unacknowledged ticks'
+    if series["status"] == "cancelled":
+        return f'{series["label"]}: recurring schedule cancelled'
+    if series["status"] == "completed":
+        return f'{series["label"]}: recurring schedule completed'
+    return f'{series["label"]}: every {interval}, {pending}/{limit} unacknowledged ticks'
 
 
 def command_every(args: argparse.Namespace) -> int:
@@ -496,7 +520,7 @@ def command_every(args: argparse.Namespace) -> int:
             raise TimerError("conflict", f'key "{args.key}" is already used by a timer')
         existing = [
             item for item in state["series"]
-            if item["status"] == "active"
+            if item["status"] in {"active", "paused"}
             and item.get("namespace", "default") == namespace
             and item["key"].casefold() == args.key.casefold()
         ]
@@ -504,8 +528,10 @@ def command_every(args: argparse.Namespace) -> int:
             series = existing[0]
             if series.get("owner", "local") != owner:
                 raise TimerError("owner_mismatch", f'recurring key "{args.key}" is owned by another owner')
-            same_contract = math.isclose(series["interval_seconds"], interval, abs_tol=0.001) and math.isclose(
-                series["window_seconds"], until, abs_tol=0.001
+            same_contract = (
+                math.isclose(series["interval_seconds"], interval, abs_tol=0.001)
+                and math.isclose(series["window_seconds"], until, abs_tol=0.001)
+                and series.get("max_unacknowledged_ticks", 3) == args.max_unacked
             )
             if not same_contract:
                 raise TimerError("conflict", f'recurring key "{args.key}" already has a different schedule')
@@ -524,6 +550,8 @@ def command_every(args: argparse.Namespace) -> int:
             "next_at": now + interval,
             "until_at": now + until,
             "tick_count": 0,
+            "unacknowledged_ticks": 0,
+            "max_unacknowledged_ticks": args.max_unacked,
             "message": args.message,
             "ref": args.ref,
             "payload": payload,
@@ -543,19 +571,22 @@ def command_list(args: argparse.Namespace) -> int:
     now = time.time()
     namespace = namespace_for(args)
     with locked_state() as (state, _):
-        for timer in state["timers"]:
-            refresh(timer, now, materialize_event=True)
+        refresh_all(state, now)
         timers = [
             public_timer(timer, now)
             for timer in state["timers"]
             if timer.get("namespace", "default") == namespace
+        ] + [
+            public_series(series)
+            for series in state.get("series", [])
+            if series.get("namespace", "default") == namespace
         ]
     if not args.all:
-        timers = [timer for timer in timers if timer["status"] == "active"]
+        timers = [timer for timer in timers if timer["status"] in {"active", "paused"}]
     if args.mine:
         timers = [timer for timer in timers if timer["owner"] == owner_for(args)]
     if not timers and args.hint_if_empty and not args.json:
-        print("No active timers. Start one: timer 10m rice")
+        print("No active timers or recurring schedules. Start one: timer 10m rice")
         return 0
     emit(timers, args.json)
     return 0
@@ -564,22 +595,33 @@ def command_list(args: argparse.Namespace) -> int:
 def command_status(args: argparse.Namespace) -> int:
     with locked_state() as (state, _):
         if args.identifier or args.id or args.key:
-            timer = resolve_timer_arg(state, args)
-            refresh(timer, materialize_event=True)
-            result: Any = public_timer(timer)
+            try:
+                timer = resolve_timer_arg(state, args)
+                refresh(timer, materialize_event=True)
+                result: Any = public_timer(timer)
+            except (KeyError, TimerError) as error:
+                if isinstance(error, TimerError) and error.code != "not_found":
+                    raise
+                identifier = args.id or args.key or args.identifier
+                refresh_all(state)
+                result = public_series(find_series(state, identifier, namespace_for(args)))
         else:
             now = time.time()
-            for timer in state["timers"]:
-                refresh(timer, now, materialize_event=True)
+            refresh_all(state, now)
             active = [
                 public_timer(timer, now)
                 for timer in state["timers"]
                 if timer["status"] == "active"
                 and timer.get("namespace", "default") == namespace_for(args)
+            ] + [
+                public_series(series)
+                for series in state.get("series", [])
+                if series["status"] in {"active", "paused"}
+                and series.get("namespace", "default") == namespace_for(args)
             ]
             result = active[0] if len(active) == 1 else active
     if not args.identifier and not result and not args.json:
-        print("No active timers. Start one: timer 10m rice")
+        print("No active timers or recurring schedules. Start one: timer 10m rice")
         return 0
     emit(result, args.json)
     return 0
@@ -613,7 +655,7 @@ def command_cancel(args: argparse.Namespace) -> int:
             timer = active[0]
         require_owner(timer, args)
         event_type = timer["status"]
-        if timer["status"] == "active":
+        if timer["status"] in {"active", "paused"}:
             timer["status"] = "cancelled"
             timer["cancelled_at"] = time.time()
             emit_once(state_path(), timer, "cancelled", timestamp=timer["cancelled_at"])
@@ -780,10 +822,25 @@ def refresh_all(state: dict[str, Any], now: float | None = None) -> None:
     for timer in state["timers"]:
         refresh(timer, now, materialize_event=True)
     for series in state.get("series", []):
-        if series["status"] != "active":
+        if series["status"] not in {"active", "paused"}:
             continue
+        limit = int(series.get("max_unacknowledged_ticks", 3))
+        pending = unacknowledged_series_ticks(state_path(), series["id"])
+        series["unacknowledged_ticks"] = pending
+        if pending >= limit:
+            series["status"] = "paused"
+            series["pause_reason"] = "unacknowledged_tick_limit"
+            continue
+        if series["status"] == "paused":
+            series["status"] = "active"
+            series.pop("pause_reason", None)
+            series["next_at"] = now + series["interval_seconds"]
         emitted = 0
         while series["next_at"] <= now and series["next_at"] <= series["until_at"]:
+            if pending >= limit:
+                series["status"] = "paused"
+                series["pause_reason"] = "unacknowledged_tick_limit"
+                break
             series["tick_count"] += 1
             event = make_event(
                 series,
@@ -798,6 +855,8 @@ def refresh_all(state: dict[str, Any], now: float | None = None) -> None:
             append_event(state_path(), event)
             series["last_event_id"] = event["event_id"]
             series["next_at"] += series["interval_seconds"]
+            pending += 1
+            series["unacknowledged_ticks"] = pending
             emitted += 1
             if emitted >= 100:
                 break
@@ -1513,6 +1572,12 @@ def build_parser() -> argparse.ArgumentParser:
     every = subparsers.add_parser("every", help="schedule recurring heartbeat events")
     every.add_argument("interval", help="tick interval such as 2m")
     every.add_argument("--until", required=True, help="maximum schedule duration such as 30m")
+    every.add_argument(
+        "--max-unacked",
+        type=positive_int,
+        default=3,
+        help="pause after this many unacknowledged ticks (default: 3)",
+    )
     every.add_argument("--key", required=True, help="idempotent recurring schedule key")
     every.add_argument("--label", help="human-readable label")
     every.add_argument("--message", help="continuation message returned with each tick")
@@ -1596,6 +1661,13 @@ def positive_float(value: str) -> float:
     number = float(value)
     if not math.isfinite(number) or number <= 0:
         raise argparse.ArgumentTypeError("must be a finite number greater than zero")
+    return number
+
+
+def positive_int(value: str) -> int:
+    number = int(value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError("must be an integer greater than zero")
     return number
 
 

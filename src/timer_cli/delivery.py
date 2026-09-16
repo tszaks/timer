@@ -98,10 +98,11 @@ def locked_consumers(state_file: Path) -> Iterator[dict[str, Any]]:
     with lock_path.open("a+", encoding="utf-8") as lock_handle:
         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
         raw = path.read_text(encoding="utf-8") if path.exists() else ""
-        state = json.loads(raw) if raw else {"version": 1, "consumers": {}}
+        state = json.loads(raw) if raw else {"version": 1, "consumers": {}, "acknowledged_event_ids": []}
         state.setdefault("version", 1)
         state.setdefault("generation", 0)
         state.setdefault("consumers", {})
+        state.setdefault("acknowledged_event_ids", [])
         recover_compaction(state_file, state, path)
         yield state
         write_json_atomic(path, state)
@@ -297,6 +298,9 @@ def ack_event(
             record.get("last_acked_event_id") == event_id
             and record.get("last_acked_lease_id") == lease_id
         ):
+            acknowledged = set(state.get("acknowledged_event_ids", []))
+            acknowledged.add(event_id)
+            state["acknowledged_event_ids"] = sorted(acknowledged)
             return {
                 "ok": True,
                 "schema": CLAIM_SCHEMA,
@@ -316,6 +320,9 @@ def ack_event(
         record["last_acked_event_id"] = event_id
         record["last_acked_lease_id"] = lease_id
         record["lease"] = None
+        acknowledged = set(state.get("acknowledged_event_ids", []))
+        acknowledged.add(event_id)
+        state["acknowledged_event_ids"] = sorted(acknowledged)
     return {
         "ok": True,
         "schema": CLAIM_SCHEMA,
@@ -324,6 +331,20 @@ def ack_event(
         "event_id": event_id,
         "lease_id": lease_id,
     }
+
+
+def unacknowledged_series_ticks(state_file: Path, series_id: str) -> int:
+    """Count retained ticks for a series that no consumer has acknowledged."""
+    with locked_consumers(state_file) as state:
+        acknowledged = set(state.get("acknowledged_event_ids", []))
+        records, _ = read_event_records(state_file)
+        return sum(
+            1
+            for event, _, _ in records
+            if event.get("event") == "tick"
+            and event.get("id") == series_id
+            and event.get("event_id") not in acknowledged
+        )
 
 
 def nack_event(
@@ -445,6 +466,10 @@ def compact_events(state_file: Path) -> dict[str, Any]:
             removed = [json.loads(line) for line in prefix.splitlines() if line.strip()]
             state_after = deepcopy(state)
             state_after["generation"] = int(state.get("generation", 0)) + 1
+            removed_ids = {event["event_id"] for event in removed}
+            state_after["acknowledged_event_ids"] = sorted(
+                set(state_after.get("acknowledged_event_ids", [])) - removed_ids
+            )
             for record in state_after["consumers"].values():
                 record["cursor"] = max(0, int(record.get("cursor", 0)) - cutoff)
                 lease = record.get("lease")

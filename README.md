@@ -2,7 +2,7 @@
 
 [![Tests](https://github.com/tszaks/timer/actions/workflows/test.yml/badge.svg)](https://github.com/tszaks/timer/actions/workflows/test.yml)
 
-Timer is a persistent timer, stopwatch, and deferred-work CLI for Unix systems. Version 0.6.0 requires Python 3.10 or newer and has no third-party runtime dependencies.
+Timer is a persistent timer, stopwatch, and deferred-work CLI for Unix systems. Version 0.7.0 requires Python 3.10 or newer and has no third-party runtime dependencies.
 
 Timer stores absolute deadlines on disk. Timers and stopwatches survive terminal exits and system sleep. An expiration is processed the next time a Timer command refreshes state, or shortly after its deadline when the optional daemon is running.
 
@@ -68,9 +68,9 @@ Useful commands:
 
 | Command | Result |
 | --- | --- |
-| `timer` | List active timers |
-| `timer LABEL` | Show one timer |
-| `timer list --all` | Include expired and cancelled timers |
+| `timer` | List active timers and recurring schedules |
+| `timer LABEL` | Show one timer or recurring schedule |
+| `timer list --all` | Include terminal timers and recurring schedules |
 | `timer rename OLD NEW` | Rename an active timer without changing its deadline |
 | `timer cancel LABEL` | Cancel a timer |
 | `timer wait LABEL` | Block until a timer expires or is cancelled |
@@ -268,19 +268,20 @@ Create a bounded recurring schedule with `every`:
 ```sh
 timer every 2m \
   --until 30m \
+  --max-unacked 3 \
   --key deploy-check \
   --message "Read deployment status. Act only if it failed." \
   --ref thread:THREAD_ID \
   --json
 ```
 
-The schedule emits durable `tick` events until its `--until` window ends. Cancel it with:
+The schedule emits durable `tick` events until its `--until` window ends. Bare `timer`, `timer list`, and `timer status` include active or backlog-paused schedules, so a repeating job is visible on the default status surface. Cancel it with:
 
 ```sh
 timer cancel --key deploy-check
 ```
 
-Recurring ticks are materialized by the daemon, `claim`, `pending`, `drain`, JSON event following, or multi-timer waits. If several ticks are overdue, one refresh emits at most 100 and a later refresh continues the catch-up.
+Recurring ticks are materialized by the daemon, `claim`, `pending`, `drain`, JSON event following, or multi-timer waits. By default, Timer pauses a series after three ticks remain unacknowledged. `--max-unacked N` changes that bound. A successful acknowledgement by any consumer lowers the backlog; the next refresh resumes the series from the present instead of replaying every missed interval. This is a safety brake, while `--until` is only the schedule's maximum lifetime.
 
 ## Namespaces and ownership
 

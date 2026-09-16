@@ -499,6 +499,37 @@ class TimerTests(unittest.TestCase):
         self.assertEqual(cancelled["event"], "cancelled")
         self.assertEqual(cancelled["status"], "cancelled")
 
+    def test_recurring_series_is_visible_and_pauses_at_unacknowledged_limit(self) -> None:
+        self.run_cli(
+            "every", "0.02s", "--until", "1s", "--key", "rollup",
+            "--max-unacked", "2", "--json",
+        )
+        self.assertIn("rollup: every", self.run_cli().stdout)
+        time.sleep(0.08)
+
+        listed = json.loads(self.run_cli("list", "--json").stdout)
+        series = next(item for item in listed if item["key"] == "rollup")
+        direct = json.loads(self.run_cli("status", "--key", "rollup", "--json").stdout)
+
+        self.assertEqual(series["kind"], "series")
+        self.assertEqual(series["status"], "paused")
+        self.assertEqual(series["unacknowledged_ticks"], 2)
+        self.assertEqual(series["max_unacknowledged_ticks"], 2)
+        self.assertEqual(direct["id"], series["id"])
+
+        claimed = json.loads(
+            self.run_cli(
+                "claim", "--consumer", "test-worker", "--event", "tick", "--json"
+            ).stdout
+        )
+        self.run_cli(
+            "ack", claimed["delivery"]["event_id"], "--consumer", "test-worker",
+            "--lease-id", claimed["lease_id"], "--json",
+        )
+        resumed = json.loads(self.run_cli("status", "--key", "rollup", "--json").stdout)
+        self.assertEqual(resumed["status"], "active")
+        self.assertEqual(resumed["unacknowledged_ticks"], 1)
+
     def test_stopwatch_lap_is_available_as_an_event(self) -> None:
         self.run_cli("stopwatch", "start", "prep")
         self.run_cli("stopwatch", "lap", "prep")
