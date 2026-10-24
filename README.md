@@ -36,7 +36,7 @@ Timer does not play a sound or display a desktop notification by itself. It can 
 - **Survives restarts.** Deadlines are absolute and stored on disk, so closing the terminal or sleeping the machine does not lose a timer.
 - **Human short form.** `timer 10m rice`, `timer 1h30m laundry`, `timer 90 stretch`.
 - **Stopwatches with laps.** `timer stopwatch start`, `lap`, `pause`, `resume`, `reset`.
-- **Machine-readable.** Every command takes `--json`, and `timer schema --json` prints the stable contract.
+- **Machine-readable.** Commands take `--json`, and `timer schema --json` prints the stable contract.
 - **Durable agent work.** Keyed timers, leased claims, `ack` and `nack`, at-least-once delivery.
 - **Recurring schedules** with a backlog brake, so a stuck consumer cannot be flooded.
 - **Namespaces and owners** keep one agent from cancelling another's timers.
