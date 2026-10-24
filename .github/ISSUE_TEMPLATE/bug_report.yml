@@ -1,0 +1,61 @@
+name: Bug report
+description: Something in Timer does not work as it should
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. If Timer lost, repeated or delayed an expiration event, please say so in the title. Those bugs are the highest priority.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you do, what did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The exact commands and their output. Use a scratch `TIMER_STATE` if you can.
+      placeholder: |
+        1. timer start 10s --key demo --json
+        2. ...
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS and version
+      placeholder: "macOS 26.5 or Ubuntu 24.04"
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      placeholder: "3.12.4"
+    validations:
+      required: true
+  - type: input
+    id: timer-version
+    attributes:
+      label: Timer version
+      description: The `version` in pyproject.toml, or the commit you installed.
+      placeholder: "0.8.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: daemon
+    attributes:
+      label: Was the daemon or the wake service running?
+      options:
+        - "No"
+        - "Daemon in a terminal"
+        - "Wake service (timer setup)"
+        - "Not sure"
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Output of `timer consumers --json` or `timer service status --json` if delivery is involved.
