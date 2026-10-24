@@ -1,12 +1,47 @@
-# Timer
+<h1 align="center">Timer</h1>
 
-[![Tests](https://github.com/tszaks/timer/actions/workflows/test.yml/badge.svg)](https://github.com/tszaks/timer/actions/workflows/test.yml)
+<p align="center">
+  A persistent timer, stopwatch and deferred-work CLI for Unix systems, built to hand work to AI agents later.
+</p>
+
+<p align="center">
+  <a href="https://github.com/tszaks/timer/actions/workflows/test.yml"><img src="https://github.com/tszaks/timer/actions/workflows/test.yml/badge.svg" alt="Tests"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/tszaks/timer" alt="MIT license"></a>
+  <img src="https://img.shields.io/badge/python-3.10%2B-blue" alt="Python 3.10 or later">
+  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey" alt="macOS and Linux">
+</p>
+
+```console
+$ timer 10m rice
+rice: 10m 00s remaining
+$ timer 25m peppers
+peppers: 25m 00s remaining
+$ timer list
+rice: 10m 00s remaining
+peppers: 25m 00s remaining
+$ timer cancel peppers
+peppers: cancelled (24m 59s remaining)
+$ timer stopwatch start prep
+prep: running (0s elapsed)
+```
 
 Timer is a persistent timer, stopwatch, and deferred-work CLI for Unix systems. Version 0.8.0 requires Python 3.10 or newer and has no third-party runtime dependencies.
 
 Timer stores absolute deadlines on disk. Timers and stopwatches survive terminal exits and system sleep. An expiration is processed the next time a Timer command refreshes state, or shortly after its deadline when the optional daemon is running.
 
-Timer does not play a sound or display a desktop notification by itself. It can print countdowns, write expiration files, run a hook, or queue a new Codex turn through the included supervisor.
+Timer does not play a sound or display a desktop notification by itself. It can print countdowns, write expiration files, run a hook, or queue a new Codex turn through the included supervisor. It is for people who want a kitchen-style timer in the terminal, and for AI agents that need to continue a task in a later turn.
+
+## Features
+
+- **Survives restarts.** Deadlines are absolute and stored on disk, so closing the terminal or sleeping the machine does not lose a timer.
+- **Human short form.** `timer 10m rice`, `timer 1h30m laundry`, `timer 90 stretch`.
+- **Stopwatches with laps.** `timer stopwatch start`, `lap`, `pause`, `resume`, `reset`.
+- **Machine-readable.** Commands take `--json`, and `timer schema --json` prints the stable contract.
+- **Durable agent work.** Keyed timers, leased claims, `ack` and `nack`, at-least-once delivery.
+- **Recurring schedules** with a backlog brake, so a stuck consumer cannot be flooded.
+- **Namespaces and owners** keep one agent from cancelling another's timers.
+- **Optional daemon and Codex supervisor** to deliver expirations to a hook, a wake directory or a queued Codex turn.
+- **No dependencies.** Standard library only. State lives in plain JSON files under `~/.local/share/timer`.
 
 ## Install
 
@@ -344,6 +379,12 @@ uv build
 
 The GitHub workflow uses two jobs: Python 3.10 on Linux and Python 3.14 on macOS.
 
+## Contributing
+
+Bug reports and pull requests are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) first. Security problems go through [SECURITY.md](SECURITY.md). Everyone taking part follows the [Code of Conduct](CODE_OF_CONDUCT.md).
+
+Docs: [agent skill](skills/timer-agent/SKILL.md) · [AGENTS.md](AGENTS.md) · [changelog](CHANGELOG.md)
+
 ## License
 
-MIT. See [LICENSE](LICENSE).
+[MIT](LICENSE) © 2026 Tyler Szakacs
